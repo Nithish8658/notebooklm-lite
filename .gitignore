@@ -1,0 +1,67 @@
+# Secrets
+.env
+*.env
+
+# Python Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+
+# Large ML/AI Models (Downloaded on demand)
+models/
+backend/models/
+*.onnx
+*.bin
+*.pt
+*.pth
+
+# Vector Database Data
+qdrant_data/
+backend/qdrant_data/
+
+# Local Databases (SQLite)
+*.db
+*.sqlite3
+backend/platform_sync.db
+
+# User Uploads and Processed Text
+uploads/
+backend/uploads/
+backend/extracted_text/
+extracted_text/
+
+# Frontend Artifacts
+node_modules/
+frontend-react/node_modules/
+build/
+dist/
+.eslintcache
+
+# Logs and Metrics
+*.log
+backend/*.log
+backend/events.jsonl
+backend/metrics.json
+metrics.json
+
+# OS Specific
+.DS_Store
+Thumbs.db
+
+# Binaries/Tools
+backend/ingestion/ffmpeg
+backend/ingestion/ffplay
+backend/ingestion/ffprobe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Temporary / Backup Folders
+copy/
+temp/
+tmp/
