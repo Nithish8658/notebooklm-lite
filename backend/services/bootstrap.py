@@ -1,9 +1,27 @@
 import os
+import sys
 import logging
 from pathlib import Path
 from huggingface_hub import snapshot_download
 
 _LOG = logging.getLogger("bootstrap")
+
+# AC-100: Critical DLL Path Injection for OpenVINO on Windows
+# ONNX Runtime 1.20+ with OpenVINO EP often fails to find 'openvino.dll' on Windows 
+# because it's in a subfolder of the 'openvino' package.
+if sys.platform == "win32":
+    try:
+        import openvino
+        # Expected path: .venv\Lib\site-packages\openvino\libs
+        ov_libs = Path(openvino.__file__).parent / "libs"
+        if ov_libs.exists():
+            _LOG.info("Windows DLL Path: Injecting OpenVINO libs at %s", ov_libs)
+            os.add_dll_directory(str(ov_libs.absolute()))
+        else:
+            _LOG.warning("Windows DLL Path: OpenVINO 'libs' folder not found at expected location.")
+    except Exception as e:
+        _LOG.debug("Windows DLL Path: OpenVINO not available for injection: %s", e)
+
 # Mapping of local folder name to Hugging Face Repo ID
 MODEL_MAP = {
     "bge-onnx": {
@@ -12,7 +30,7 @@ MODEL_MAP = {
         "allow_patterns": ["*.json", "*.txt", "onnx/model.onnx"] 
     },
     "reranker-onnx": {
-        "repo_id": "Xenova/ms-marco-MiniLM-L-6-v2",
+        "repo_id": "Xenova/ms-marco-MiniLM-L-4-v2",
         # Only download the quantized version (3x faster) and configs
         "allow_patterns": ["*.json", "*.txt", "onnx/model_quantized.onnx"]
     }

@@ -1,18 +1,34 @@
 import os
+import sys
 import logging
 from typing import List, Dict, Optional
 from pathlib import Path
 from collections import OrderedDict
 import multiprocessing
 
+# AC-100: Critical DLL Path Injection for OpenVINO on Windows
+if sys.platform == "win32":
+    try:
+        import openvino
+        ov_libs = Path(openvino.__file__).parent / "libs"
+        if ov_libs.exists():
+            os.add_dll_directory(str(ov_libs.absolute()))
+    except Exception:
+        pass
+
 import torch
 from transformers import AutoTokenizer
 import onnxruntime as ort
 from optimum.onnxruntime import ORTModelForSequenceClassification
+try:
+    from optimum.intel.openvino import OVModelForSequenceClassification
+    _HAS_OV = True
+except ImportError:
+    _HAS_OV = False
 
 _LOG = logging.getLogger("rerank")
 _RERANKER_MODEL = None
-_DEFAULT_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+_DEFAULT_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-4-v2"
 
 # ---- FUSION CONFIG ----
 # These weights ensure structural graph context and deep semantic relevance are balanced.
@@ -52,12 +68,12 @@ class OnnxCrossEncoder:
                  model_filename, subfolder or "root", onnx_dir)
         
         # 1. Thread Management: Hardware-Aware and Scale-Safe
-        # ... rest of __init__ logic ...
         env_threads = os.getenv("RERANKER_THREADS")
         if env_threads:
             num_threads = int(env_threads)
         else:
             total_cores = multiprocessing.cpu_count()
+            # Optimization: 4 threads is often the sweet spot for MiniLM on consumer CPUs
             num_threads = min(4, max(1, total_cores // 2))
             
         _LOG.info("CPU Optimization: Using %d threads for reranking inference.", num_threads)
@@ -69,17 +85,34 @@ class OnnxCrossEncoder:
 
         available_providers = ort.get_available_providers()
         provider = "CPUExecutionProvider"
+        provider_options = None
+
         if "OpenVINOExecutionProvider" in available_providers:
             provider = "OpenVINOExecutionProvider"
-            _LOG.info("OpenVINO detected. Enabling high-speed Intel inference.")
+            # Optimization: num_streams=1 reduces latency for single-user queries
+            provider_options = {
+                "device_type": "CPU",
+                "num_streams": "1"
+            }
+            _LOG.info("OpenVINO detected. Enabling high-speed Intel inference (Latency Mode).")
         
         # Use .as_posix() for Windows path compatibility
         self.tokenizer = AutoTokenizer.from_pretrained(onnx_dir.as_posix(), local_files_only=True)
+        
+        # AC-99: Verify model size to confirm quantization is active
+        model_path = onnx_dir / (subfolder or "") / model_filename
+        if model_path.exists():
+            size_mb = os.path.getsize(model_path) / (1024 * 1024)
+            _LOG.info("Model Verification: Loaded %s (Size: %.2f MB)", model_filename, size_mb)
+            if size_mb > 40: # L-4 quantized is ~15MB, L-6 is ~22MB. 
+                _LOG.warning("PERFORMANCE ALERT: Model size (%.2f MB) suggests this is NOT the quantized version. Expect high latency.", size_mb)
+
         self.model = ORTModelForSequenceClassification.from_pretrained(
             onnx_dir.as_posix(),
             file_name=model_filename,
             subfolder=subfolder,
             provider=provider,
+            provider_options=provider_options,
             session_options=sess_options,
             local_files_only=True
         )
@@ -100,8 +133,9 @@ class OnnxCrossEncoder:
         total_batches = (len(pairs) + batch_size - 1) // batch_size
         
         t_tokenization = 0.0
-        t_inference = 0.0
-        t_postprocess = 0.0
+        t_forward = 0.0
+        t_cleanup = 0.0
+        total_tokens = 0
 
         for i in range(0, len(pairs), batch_size):
             batch_num = (i // batch_size) + 1
@@ -117,15 +151,20 @@ class OnnxCrossEncoder:
                 return_tensors="pt",
             )
             t_tokenization += time.perf_counter() - t0
+            
+            # Track batch stats
+            batch_seq_len = inputs["input_ids"].shape[1]
+            total_tokens += (len(batch) * batch_seq_len)
 
-            # 2. Inference
+            # 2. Forward Pass (Raw ONNX Execution)
             t1 = time.perf_counter()
             with torch.no_grad():
-                logits = self.model(**inputs).logits
-            t_inference += time.perf_counter() - t1
+                outputs = self.model(**inputs)
+            t_forward += time.perf_counter() - t1
 
-            # 3. Post-processing
+            # 3. Cleanup & Calibration (Logits -> Sigmoid -> NumPy)
             t2 = time.perf_counter()
+            logits = outputs.logits
             if logits.shape[1] == 1:
                 scores = logits.squeeze(-1)
             else:
@@ -134,20 +173,22 @@ class OnnxCrossEncoder:
             # Calibration: apply temperature before sigmoid
             scores = torch.sigmoid(scores / CALIBRATION_TEMP).cpu().numpy()
             scores_out.extend(scores.tolist())
-            t_postprocess += time.perf_counter() - t2
+            t_cleanup += time.perf_counter() - t2
             
-            if batch_num % 2 == 0 or batch_num == total_batches:
-                print(f"      [RERANK BATCH {batch_num}/{total_batches}] avg inference: {t_inference/batch_num:.4f}s")
+            if batch_num % 1 == 0 or batch_num == total_batches:
+                _LOG.debug(f"      [BATCH {batch_num}/{total_batches}] seq_len: {batch_seq_len} | forward: {t1-t0:.4f}s")
 
         wall_time = time.perf_counter() - t_predict_start
         cpu_time = time.process_time() - cpu_start
         parallelism = cpu_time / wall_time if wall_time > 0 else 0
         
-        print(f"   -> RERANK PREDICT BREAKDOWN (N={len(pairs)}):")
-        print(f"      - Tokenization: {t_tokenization:.2f}s")
-        print(f"      - Inference:    {t_inference:.2f}s")
-        print(f"      - Parallelism:  {parallelism:.1f}x Cores Active")
-        print(f"      - Total Wall:   {wall_time:.2f}s")
+        print(f"\n   -> RERANK DEEP-DIVE (N={len(pairs)} pairs):")
+        print(f"      - Avg Seq Length: {total_tokens/len(pairs):.1f} tokens")
+        print(f"      - Tokenization:   {t_tokenization:.4f}s")
+        print(f"      - Forward Pass:   {t_forward:.4f}s (Raw Math)")
+        print(f"      - Result Cleanup: {t_cleanup:.4f}s")
+        print(f"      - Parallelism:    {parallelism:.1f}x Cores")
+        print(f"      - Wall Clock:     {wall_time:.4f}s")
 
         return scores_out
 
@@ -234,6 +275,11 @@ def rerank_with_cross_encoder(
     top_candidates = list(candidates)[: min(len(candidates), rerank_top_k)]
 
     # ---- Build query list ----
+    import time
+    t_start = time.perf_counter()
+    
+    # PART 2.1: Expansion & Context
+    t_exp_start = time.perf_counter()
     queries = [query]
     if alternative_queries:
         for q in alternative_queries:
@@ -241,85 +287,94 @@ def rerank_with_cross_encoder(
                 queries.append(q)
                 if max_rewrites is not None and len(queries) - 1 >= max_rewrites:
                     break
-    # dedupe preserving order
     seen_q = set()
     queries = [q for q in queries if not (q in seen_q or seen_q.add(q))]
 
-    # ---- Score with caching ----
-    cached_scores: dict[tuple, float] = {}
-    to_score_pairs: list[tuple] = []
-    to_score_keys: list[tuple] = []
-    
-    # AC-16: Track unique pairs in THIS request to prevent redundant scoring
-    # within the same batch. This fixes the '-42 cache hits' bug and slashes latency.
-    request_unique_keys = set()
-
     for c in top_candidates:
-        # Context Injection: Leverage section metadata for better semantic mapping
         section = c.get("metadata", {}).get("section_title", "")
         text = c.get("text", "")
         contextual_text = f"Section: {section}\n{text}" if section else text
         c["_contextual_text"] = contextual_text
+    t_exp_end = time.perf_counter()
 
+    # PART 2.2: Cache Reconciliation
+    t_cache_start = time.perf_counter()
+    cached_scores: dict[tuple, float] = {}
+    to_score_pairs: list[tuple] = []
+    to_score_keys: list[tuple] = []
+    request_unique_keys = set()
+
+    for c in top_candidates:
+        text = c["_contextual_text"]
         for q in queries:
-            key = (q, contextual_text)
+            key = (q, text)
             if key in _SCORE_CACHE:
                 cached_scores[key] = _SCORE_CACHE[key]
             elif key not in request_unique_keys:
-                # Only add if not already in the global cache AND not already in this batch
-                to_score_pairs.append((q, contextual_text))
+                to_score_pairs.append((q, text))
                 to_score_keys.append(key)
                 request_unique_keys.add(key)
 
-    total_pairs_attempted = len(top_candidates) * len(queries)
-    actual_hits = total_pairs_attempted - len(to_score_pairs)
+    total_pairs = len(top_candidates) * len(queries)
+    actual_hits = total_pairs - len(to_score_pairs)
+    t_cache_end = time.perf_counter()
+    
+    _LOG.info("[RERANK] Part 2.1 (Expansion): %.4fs | Part 2.2 (Cache): %.4fs (Hits: %d/%d)", 
+             t_exp_end - t_exp_start, t_cache_end - t_cache_start, actual_hits, total_pairs)
 
     try:
+        # PART 2.3: Model Inference
         model = get_reranker()
         if to_score_pairs:
+            t_inf_start = time.perf_counter()
             scores = model.predict(to_score_pairs, batch_size=batch_size)
+            t_inf_end = time.perf_counter()
+            _LOG.info("[RERANK] Part 2.3 (Inference): %.4fs for %d pairs (%.2fms/pair)", 
+                     t_inf_end - t_inf_start, len(to_score_pairs), ((t_inf_end - t_inf_start)/len(to_score_pairs))*1000)
+            
             for key, sc in zip(to_score_keys, scores):
                 _SCORE_CACHE[key] = sc
                 cached_scores[key] = sc
 
-        # ---- Aggregate & Fuse ----
+        # ---- PHASE 3: AGGREGATE, FUSE & FILTER ----
+        # PART 3.1: Fusion & Max-Sim
+        t_fusion_start = time.perf_counter()
         for c in top_candidates:
             text = c["_contextual_text"]
             c_scores = [cached_scores.get((q, text), 0.0) for q in queries]
-            
-            # Max-Sim across query variations
             max_rerank = max(c_scores) if c_scores else 0.0
             c["rerank_score"] = max_rerank
 
             if use_fusion:
-                # Harmonize graph resonance with semantic cross-encoding
                 incoming_score = c.get("score", 0.0)
                 c["final_score"] = (GRAPH_WEIGHT * incoming_score) + (RERANK_WEIGHT * max_rerank)
             else:
                 c["final_score"] = max_rerank
+        t_fusion_end = time.perf_counter()
 
-        # ---- Dynamic Filtering (Thresholding & Gap Analysis) ----
-        # 1. Minimum Score Threshold
-        
-        # Anything below 0.3 in a Cross-Encoder is usually just keyword overlap, not a real answer.
+        # PART 3.2: Dynamic Filtering
+        t_filter_start = time.perf_counter()
         SCORE_THRESHOLD = 0.3 
         filtered = [c for c in top_candidates if c.get("final_score", 0) >= SCORE_THRESHOLD]
         
-        # 2. Gap Analysis (Relative Cut-off)
-        # Tightened from 0.25 to 0.15. If the relevance drops by >15%, we cut off the rest
-        # to ensure the LLM only sees the most "elite" context.
         GAP_THRESHOLD = 0.25  
         final_candidates = []
         if filtered:
             ranked_filtered = sorted(filtered, key=lambda x: -x["final_score"])
             final_candidates.append(ranked_filtered[0])
             for i in range(1, len(ranked_filtered)):
-                # If current candidate is much worse than previous, stop
-                if (ranked_filtered[i-1]["final_score"] - ranked_filtered[i]["final_score"]) > GAP_THRESHOLD:
+                gap = ranked_filtered[i-1]["final_score"] - ranked_filtered[i]["final_score"]
+                if gap > GAP_THRESHOLD:
+                    _LOG.info("[RERANK] Part 3.2: Gap Triggered at rank %d (Gap: %.4f)", i, gap)
                     break
                 final_candidates.append(ranked_filtered[i])
+        t_filter_end = time.perf_counter()
         
-        # ---- Audit Sources ----
+        _LOG.info("[RERANK] Part 3.1 (Fusion): %.4fs | Part 3.2 (Filtering): %.4fs (Survivors: %d/%d)", 
+                 t_fusion_end - t_fusion_start, t_filter_end - t_filter_start, len(final_candidates), len(top_candidates))
+        
+        # PART 3.3: Audit & Cleanup
+        t_audit_start = time.perf_counter()
         from collections import Counter
         accepted_origins = Counter()
         rejected_origins = Counter()
@@ -336,6 +391,7 @@ def rerank_with_cross_encoder(
 
         # Return only the best ones, capped by output_k (limit)
         final_results = final_candidates[: min(output_k, len(final_candidates))]
+        t_audit_end = time.perf_counter()
 
         # Log survival count
         _LOG.info(
@@ -361,6 +417,7 @@ def rerank_with_cross_encoder(
         print(f"------------------------------\n")
 
         print(f"INFO: Reranker found {len(final_candidates)} high-relevance candidates. Returning top {len(final_results)} to user.")
+        _LOG.info("[RERANK] Part 3.3 (Audit): %.4fs | TOTAL TIME: %.4fs", t_audit_end - t_audit_start, time.perf_counter() - t_start)
 
         return final_results
 

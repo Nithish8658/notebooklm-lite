@@ -274,7 +274,7 @@ async def generate_podcast_script(
     chunk_fetcher: Callable,
     dense_retrieve_fn: Callable,
     call_gemini_fn: Optional[Callable[[str], Awaitable[str]]] = None,
-    cohort_id: str = "default_cohort",
+    batch_id: str = "default_batch",
     complexity: str = "Undergrad"
 ) -> Optional[List[PodcastSegment]]:
 
@@ -300,7 +300,7 @@ async def generate_podcast_script(
             graph=graph,
             chunk_fetcher=chunk_fetcher,
             dense_fn=dense_retrieve_fn,
-            cohort_id=cohort_id,
+            batch_id=batch_id,
             dense_top_k=15,
             max_candidates=6,
             min_dense_score=0.30, # AC-35: Enforce Chat-level precision
@@ -394,12 +394,12 @@ async def generate_podcast(
     chunk_fetcher: Callable,
     dense_retrieve_fn: Callable,
     call_gemini_fn: Optional[Callable[[str], Awaitable[str]]] = None,
-    cohort_id: str = "default_cohort",
+    batch_id: str = "default_batch",
     complexity: str = "Undergrad"
 ) -> Optional[Podcast]:
 
     segments = await generate_podcast_script(
-        topic, bm25, graph, chunk_fetcher, dense_retrieve_fn, call_gemini_fn, cohort_id=cohort_id, complexity=complexity
+        topic, bm25, graph, chunk_fetcher, dense_retrieve_fn, call_gemini_fn, batch_id=batch_id, complexity=complexity
     )
 
     if not segments:

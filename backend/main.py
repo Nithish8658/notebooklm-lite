@@ -1,9 +1,12 @@
 import os
+import sys
 import json
 import asyncio
 import traceback
 import time
 import datetime
+from pathlib import Path
+
 import torchaudio_patch
 
 # --- HARDWARE ACCELERATION (Must be set before any ML imports) ---
@@ -43,7 +46,7 @@ from services.flashcards import generate_flashcards
 from services.quiz import generate_quiz_for_topic
 from services.podcast import generate_podcast, PodcastRefusalError
 
-from database import init_db, get_db, User, Flashcard, Quiz, Podcast, Cohort, UserEnrollment, IngestionJob, AsyncSessionLocal, engine
+from database import init_db, get_db, User, Flashcard, Quiz, Podcast, Batch, UserEnrollment, IngestionJob, AsyncSessionLocal
 from services.index_state import index_manager
 from services.embeddings import BatchEmbeddingManager, get_embedding_model, load_embedding_model
 from services.concurrency import BatchRerankManager, db_semaphore
@@ -71,19 +74,21 @@ if not GEMINI_API_KEY:
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 REDIS_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
 
+from infrastructure import init_infra, close_infra, redis_client, qdrant
+
 # --- COOLDOWN HELPERS ---
-async def set_cooldown(cohort_id: str, topic: str, cache_type: str, duration: int = 180):
-    """Sets a 3-minute (180s) cooldown for a specific topic, type, and COHORT."""
+async def set_cooldown(batch_id: str, topic: str, cache_type: str, duration: int = 180):
+    """Sets a 3-minute (180s) cooldown for a specific topic, type, and BATCH."""
     try:
-        key = f"cooldown:{cohort_id}:{cache_type}:{hashlib.md5(topic.encode()).hexdigest()}"
+        key = f"cooldown:{batch_id}:{cache_type}:{hashlib.md5(topic.encode()).hexdigest()}"
         await redis_client.set(key, "1", ex=duration)
     except Exception as e:
         print(f"DEBUG: Failed to set cooldown: {e}")
 
-async def check_cooldown(cohort_id: str, topic: str, cache_type: str):
-    """Raises HTTPException if cooldown is active for this COHORT."""
+async def check_cooldown(batch_id: str, topic: str, cache_type: str):
+    """Raises HTTPException if cooldown is active for this BATCH."""
     try:
-        key = f"cooldown:{cohort_id}:{cache_type}:{hashlib.md5(topic.encode()).hexdigest()}"
+        key = f"cooldown:{batch_id}:{cache_type}:{hashlib.md5(topic.encode()).hexdigest()}"
         if await redis_client.exists(key):
             raise HTTPException(
                 status_code=429, 
@@ -95,51 +100,6 @@ async def check_cooldown(cohort_id: str, topic: str, cache_type: str):
         print(f"DEBUG: Cooldown check error (ignoring): {e}")
 
 # ===== CACHE & DB =====
-class RedisProxy:
-    def __init__(self, url):
-        self._url = url
-        self._client = None
-        self._loop = None
-
-    def _get_client(self):
-        try:
-            loop = asyncio.get_running_loop()
-            if self._client is None or self._loop != loop or loop.is_closed():
-                self._client = redis.from_url(self._url, decode_responses=True)
-                self._loop = loop
-            return self._client
-        except RuntimeError:
-            # Fallback for sync or non-loop contexts
-            if self._client is None:
-                self._client = redis.from_url(self._url, decode_responses=True)
-            return self._client
-
-    def __getattr__(self, name):
-        return getattr(self._get_client(), name)
-
-class QdrantProxy:
-    def __init__(self, url):
-        self._url = url
-        self._client = None
-        self._loop = None
-
-    def _get_client(self):
-        try:
-            loop = asyncio.get_running_loop()
-            if self._client is None or self._loop != loop or loop.is_closed():
-                self._client = AsyncQdrantClient(url=self._url)
-                self._loop = loop
-            return self._client
-        except RuntimeError:
-            if self._client is None:
-                self._client = AsyncQdrantClient(url=self._url)
-            return self._client
-
-    def __getattr__(self, name):
-        return getattr(self._get_client(), name)
-
-redis_client = RedisProxy(REDIS_URL)
-qdrant = QdrantProxy(QDRANT_URL)
 QDRANT_COLLECTION = "document_chunks"
 CACHE_COLLECTION = "semantic_cache"
 
@@ -168,6 +128,9 @@ async def initialize_qdrant():
 # ===== LIFESPAN =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Initialize Process-Scoped Infrastructure
+    await init_infra()
+    
     print("--- HW ACCELERATION DIAGNOSTICS ---")
     try:
         import torch
@@ -198,11 +161,16 @@ async def lifespan(app: FastAPI):
 
     print("\n--- MASTER STARTUP: Verifying & Loading Models ---")
     try:
+        # Suppress noisy OpenVINO/Torch warnings for cleaner startup
+        import logging as py_logging
+        py_logging.getLogger("optimum.intel.openvino").setLevel(py_logging.ERROR)
+        os.environ["TORCH_LOGS"] = "-ERROR"
+
         from services.bootstrap import verify_all_models
         from services.embeddings import load_embedding_model, get_embedding_model
         from rerank import load_reranker, get_reranker
         
-        # 1. Master Download (Only main process handles this)
+        # 1. Master Download
         print("STARTUP: Verifying all required models on disk...")
         await asyncio.to_thread(verify_all_models)
         
@@ -212,14 +180,23 @@ async def lifespan(app: FastAPI):
         load_whisper_model()
         load_reranker()
         
-        # 3. Warm-up Inference
-        print("STARTUP: Running model sanity checks (Warm-up)...")
-        emb_model = get_embedding_model()
-        _ = emb_model.encode(["Sanity check for BGE Embedding"])
-        
-        reranker = get_reranker()
-        _ = reranker.predict([("test query", "test document context")])
-        print("STARTUP: All models verified and warmed up correctly.")
+        # 3. Deferred Warm-up (Non-blocking)
+        import threading
+        def run_warmup():
+            try:
+                t_w_start = time.time()
+                print("STARTUP: Running model sanity checks (Warm-up) in background...")
+                emb_model = get_embedding_model()
+                _ = emb_model.encode(["Sanity check for BGE Embedding"])
+                
+                reranker = get_reranker()
+                # Verify adaptive logic with a small batch
+                _ = reranker.predict([("test query", "test context")] * 2)
+                print(f"STARTUP: All models warmed up successfully in {time.time() - t_w_start:.2f}s.")
+            except Exception as e_warm:
+                print(f"WARNING: Background warm-up failed: {e_warm}")
+
+        threading.Thread(target=run_warmup, daemon=True).start()
         
         # --- AUTO-SYNC STARTUP ---
         # 1. Run one-time sync cycle for Users and Enrollments ONLY (Database only)
@@ -234,7 +211,13 @@ async def lifespan(app: FastAPI):
         def run_continuous_poller():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            loop.run_until_complete(sync_service.start())
+            async def poller_lifecycle():
+                await init_infra()
+                try:
+                    await sync_service.start()
+                finally:
+                    await close_infra()
+            loop.run_until_complete(poller_lifecycle())
 
         poller_thread = threading.Thread(target=run_continuous_poller, daemon=True)
         poller_thread.start()
@@ -242,28 +225,39 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f" CRITICAL ERROR during model loading: {e}")
         traceback.print_exc()
+    
     yield
+    # Upgrade 2: Explicit Cleanup
+    print("SHUTDOWN: Releasing all infrastructure connections...")
+    await close_infra()
 
 # ===== CACHE HELPERS =====
-async def get_semantic_cache(cohort_id: str, topic: str, cache_type: str):
+async def get_semantic_cache(batch_id: str, topic: str, cache_type: str, filters: Optional[Dict[str, Any]] = None):
     """
     Looks up a semantically similar topic in the cache.
-    Returns the cached data (dict) or None.
-    Uses a Cross-Encoder to prevent false positives for negations (e.g., 'what is java' vs 'what is not java').
+    Supports tiered caching via optional metadata filters (e.g. complexity).
     """
     try:
         # AC-22: Use Batch Embedding Manager for efficient concurrent processing
         query_vec_list = await embedding_manager.get_embedding(topic)
 
         from qdrant_client.models import Filter, FieldCondition, MatchValue
-        # Filter by cohort AND the specific tool type
+        
+        # Build strict filters
+        must_conditions = [
+            FieldCondition(key="batch_id", match=MatchValue(value=batch_id)),
+            FieldCondition(key="cache_type", match=MatchValue(value=cache_type))
+        ]
+        
+        # Add dynamic metadata filters (e.g., complexity for chat_response)
+        if filters:
+            for key, val in filters.items():
+                must_conditions.append(FieldCondition(key=key, match=MatchValue(value=val)))
+
         cache_results = await qdrant.search(
             collection_name=CACHE_COLLECTION,
             query_vector=("default", query_vec_list),
-            query_filter=Filter(must=[
-                FieldCondition(key="cohort_id", match=MatchValue(value=cohort_id)),
-                FieldCondition(key="cache_type", match=MatchValue(value=cache_type))
-            ]),
+            query_filter=Filter(must=must_conditions),
             limit=1,
             score_threshold=0.96
         )
@@ -275,46 +269,43 @@ async def get_semantic_cache(cohort_id: str, topic: str, cache_type: str):
             cached_query = hit.payload.get("query", "")
 
             # --- CROSS-ENCODER VALIDATION ---
-            # If similarity is nearly perfect (1.0), assume it's the same.
-            # Otherwise, if it's in the [0.96, 0.999] range, use Batch Reranker to check for logical equivalence.
             is_valid_hit = True
             if score < 0.999 and cached_query:
-                # AC-25: Use Batched Reranker to avoid 7s latency spike
                 ce_score = await rerank_manager.verify_logic(topic, cached_query)
-                
                 if ce_score < 0.5:
-                    print(f"CACHE REJECTED (Negation/Logic Guard): '{topic}' vs '{cached_query}' [CE Score: {ce_score:.4f}]")
                     is_valid_hit = False
-                else:
-                    print(f"CACHE VERIFIED: '{topic}' vs '{cached_query}' [CE Score: {ce_score:.4f}]")
 
             if is_valid_hit:
                 cached_json = await redis_client.get(f"studio_cache:{point_id}")
                 if cached_json:
-                    print(f"STUDIO CACHE HIT [{cache_type}]: '{topic[:30]}...' (Similarity: {score:.4f})")
+                    print(f"CACHE HIT [{cache_type}]: '{topic[:30]}...' (Score: {score:.4f})")
                     return json.loads(cached_json)
     except Exception as e:
         print(f"WARNING: Cache lookup failed: {e}")
     return None
 
-async def set_semantic_cache(cohort_id: str, topic: str, cache_type: str, data: dict):
-    """Saves a result to the semantic cache with consistent vector prefixing."""
+async def set_semantic_cache(batch_id: str, topic: str, cache_type: str, data: Any, metadata: Optional[Dict[str, Any]] = None):
+    """Saves a result to the semantic cache with optional tiered metadata."""
     try:
         model = get_embedding_model()
-        # CRITICAL: Use the same query prefix used during lookup for vector alignment
         query_vec = await asyncio.to_thread(
             model.encode, 
             "Represent this question for searching relevant passages: " + topic
         )
         query_vec_list = query_vec.tolist()
         
+        # Build payload
+        payload = {"batch_id": batch_id, "query": topic, "cache_type": cache_type}
+        if metadata:
+            payload.update(metadata)
+
         new_point_id = str(uuid4())
         await qdrant.upsert(
             collection_name=CACHE_COLLECTION,
             points=[PointStruct(
                 id=new_point_id,
                 vector={"default": query_vec_list},
-                payload={"cohort_id": cohort_id, "query": topic, "cache_type": cache_type}
+                payload=payload
             )]
         )
         # Cache for 24 hours
@@ -323,7 +314,7 @@ async def set_semantic_cache(cohort_id: str, topic: str, cache_type: str, data: 
             86400,
             json.dumps(data)
         )
-        print(f"SUCCESS: Semantic cache saved successfully for type: {cache_type}")
+        print(f"SUCCESS: Cache Tier saved: {cache_type}")
     except Exception as e:
         print(f"WARNING: Failed to save to studio cache: {e}")
 
@@ -348,7 +339,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 # ===== STATE & JOBS =====
 # Stateless Architecture: No more global STATE. 
-# BM25 and Graph are stored in Postgres per cohort.
+# BM25 and Graph are stored in Postgres per batch.
 # Chunk lookups are performed directly against Qdrant.
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -377,8 +368,8 @@ async def clear_usage_metrics():
 
 # ===== STUDIO ROUTES =====
 @app.get("/studio/flashcards")
-async def get_flashcards(user_id: str, cohort_id: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Flashcard).where(Flashcard.user_id == user_id, Flashcard.cohort_id == cohort_id))
+async def get_flashcards(username: str, batch_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Flashcard).where(Flashcard.username == username, Flashcard.batch_id == batch_id))
     cards = result.scalars().all()
     all_cards = []
     for c in cards:
@@ -386,15 +377,15 @@ async def get_flashcards(user_id: str, cohort_id: str, db: AsyncSession = Depend
     return {"cards": all_cards}
 
 class FlashcardRequest(BaseModel):
-    user_id: str
-    active_cohort_id: str
+    username: str
+    active_batch_id: str
     topics: Optional[List[str]] = None
     complexity: str = Field("Undergrad", description="Complexity level")
 
 @app.post("/studio/flashcards")
 async def create_flashcards(req: FlashcardRequest, db: AsyncSession = Depends(get_db)):
-    await verify_user_enrollment(req.user_id, req.active_cohort_id, db)
-    if not await ensure_cohort_is_loaded(req.active_cohort_id, db):
+    await verify_user_enrollment(req.username, req.active_batch_id, db)
+    if not await ensure_batch_is_loaded(req.active_batch_id, db):
         raise HTTPException(status_code=400, detail="No documents indexed.")
 
     # --- SEMANTIC CACHE LOOKUP ---
@@ -403,17 +394,17 @@ async def create_flashcards(req: FlashcardRequest, db: AsyncSession = Depends(ge
     topic_str = f"{','.join(sorted_topics)} [Level: {req.complexity}]"
     
     # AC-45: Rate Limit - Check for 3min cooldown on empty/invalid attempts
-    await check_cooldown(req.active_cohort_id, topic_str, "flashcards")
+    await check_cooldown(req.active_batch_id, topic_str, "flashcards")
 
-    cached_cards = await get_semantic_cache(req.active_cohort_id, topic_str, "flashcards")
+    cached_cards = await get_semantic_cache(req.active_batch_id, topic_str, "flashcards")
     if cached_cards:
         # Save to DB for this user too so it shows up in their list
-        db.add(Flashcard(user_id=req.user_id, cohort_id=req.active_cohort_id, payload=cached_cards, complexity=req.complexity))
+        db.add(Flashcard(username=req.username, batch_id=req.active_batch_id, payload=cached_cards, complexity=req.complexity))
         await db.commit()
         return {"cards": cached_cards}
 
     # Fetch Metadata (Optimized RAM Singleton)
-    brain = await index_manager.get_brain(req.active_cohort_id)
+    brain = await index_manager.get_brain(req.active_batch_id)
     if not brain:
         raise HTTPException(status_code=404, detail="Course resources not found.")
     
@@ -424,58 +415,58 @@ async def create_flashcards(req: FlashcardRequest, db: AsyncSession = Depends(ge
         cards = await generate_flashcards(
             bm25=bm25,
             graph=graph,
-            chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_cohort_id),
-            cohort_id=req.active_cohort_id,
+            chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_batch_id),
+            batch_id=req.active_batch_id,
             dense_retrieve_fn=dense_retrieve,
             topics=req.topics,
             complexity=req.complexity
         )
         if cards and len(cards) > 0:
-            db.add(Flashcard(user_id=req.user_id, cohort_id=req.active_cohort_id, payload=cards, complexity=req.complexity))
+            db.add(Flashcard(username=req.username, batch_id=req.active_batch_id, payload=cards, complexity=req.complexity))
             await db.commit()
             # --- SAVE TO SEMANTIC CACHE (Background) ---
             # Only cache proper answers
-            asyncio.create_task(set_semantic_cache(req.active_cohort_id, topic_str, "flashcards", cards))
+            asyncio.create_task(set_semantic_cache(req.active_batch_id, topic_str, "flashcards", cards))
         else:
             # AC-45: Negative Cache / Cooldown - Prevent retrying for 3 mins if no info found
-            await set_cooldown(req.active_cohort_id, topic_str, "flashcards")
+            await set_cooldown(req.active_batch_id, topic_str, "flashcards")
             
         return {"cards": cards}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/studio/quizzes")
-async def get_quizzes(user_id: str, cohort_id: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Quiz).where(Quiz.user_id == user_id, Quiz.cohort_id == cohort_id))
+async def get_quizzes(username: str, batch_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Quiz).where(Quiz.username == username, Quiz.batch_id == batch_id))
     quizzes = result.scalars().all()
     return {"quizzes": [q.payload for q in quizzes]}
 
 class QuizGenerateRequest(BaseModel):
-    user_id: str
-    active_cohort_id: str
+    username: str
+    active_batch_id: str
     topic: str
     complexity: str = Field("Undergrad", description="Complexity level")
 
 @app.post("/studio/quiz/generate")
 async def generate_quiz_endpoint(req: QuizGenerateRequest, db: AsyncSession = Depends(get_db)):
-    await verify_user_enrollment(req.user_id, req.active_cohort_id, db)
-    if not await ensure_cohort_is_loaded(req.active_cohort_id, db):
+    await verify_user_enrollment(req.username, req.active_batch_id, db)
+    if not await ensure_batch_is_loaded(req.active_batch_id, db):
         raise HTTPException(status_code=400, detail="No documents indexed.")
 
     # --- SEMANTIC CACHE LOOKUP ---
     topic_with_level = f"{req.topic} [Level: {req.complexity}]"
     
     # AC-45: Rate Limit - Check for 3min cooldown
-    await check_cooldown(req.active_cohort_id, req.topic, "quiz")
+    await check_cooldown(req.active_batch_id, req.topic, "quiz")
 
-    cached_quiz = await get_semantic_cache(req.active_cohort_id, topic_with_level, "quiz")
+    cached_quiz = await get_semantic_cache(req.active_batch_id, topic_with_level, "quiz")
     if cached_quiz:
-        db.add(Quiz(user_id=req.user_id, cohort_id=req.active_cohort_id, payload=cached_quiz, complexity=req.complexity))
+        db.add(Quiz(username=req.username, batch_id=req.active_batch_id, payload=cached_quiz, complexity=req.complexity))
         await db.commit()
         return cached_quiz
 
     # Fetch Metadata (Optimized RAM Singleton)
-    brain = await index_manager.get_brain(req.active_cohort_id)
+    brain = await index_manager.get_brain(req.active_batch_id)
     if not brain:
         raise HTTPException(status_code=404, detail="Course resources not found.")
     
@@ -487,21 +478,21 @@ async def generate_quiz_endpoint(req: QuizGenerateRequest, db: AsyncSession = De
             topic=req.topic,
             bm25=bm25,
             graph=graph,
-            chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_cohort_id),
+            chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_batch_id),
             dense_retrieve_fn=dense_retrieve,
-            cohort_id=req.active_cohort_id,
+            batch_id=req.active_batch_id,
             complexity=req.complexity
         )
         if quiz:
-            db.add(Quiz(user_id=req.user_id, cohort_id=req.active_cohort_id, payload=quiz.dict(), complexity=req.complexity))
+            db.add(Quiz(username=req.username, batch_id=req.active_batch_id, payload=quiz.dict(), complexity=req.complexity))
             await db.commit()
             # --- SAVE TO SEMANTIC CACHE (Background) ---
             # Only cache proper answers
-            asyncio.create_task(set_semantic_cache(req.active_cohort_id, topic_with_level, "quiz", quiz.dict()))
+            asyncio.create_task(set_semantic_cache(req.active_batch_id, topic_with_level, "quiz", quiz.dict()))
             return quiz.dict()
         else:
             # AC-45: Negative Cache / Cooldown - Prevent retrying for 3 mins if no info found
-            await set_cooldown(req.active_cohort_id, req.topic, "quiz")
+            await set_cooldown(req.active_batch_id, req.topic, "quiz")
             raise HTTPException(status_code=400, detail="The provided text contains no information regarding the topic.")
     except HTTPException:
         raise
@@ -509,14 +500,14 @@ async def generate_quiz_endpoint(req: QuizGenerateRequest, db: AsyncSession = De
         raise HTTPException(status_code=500, detail=str(e))
 
 class PodcastGenerateRequest(BaseModel):
-    user_id: str
-    active_cohort_id: str
+    username: str
+    active_batch_id: str
     topic: str = Field(..., max_length=500)
     complexity: str = Field("Undergrad")
 
 @app.get("/studio/podcasts")
-async def get_podcasts(user_id: str, cohort_id: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Podcast).where(Podcast.user_id == user_id, Podcast.cohort_id == cohort_id))
+async def get_podcasts(username: str, batch_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Podcast).where(Podcast.username == username, Podcast.batch_id == batch_id))
     podcasts = result.scalars().all()
     formatted = []
     for p in podcasts:
@@ -538,7 +529,7 @@ async def get_podcasts(user_id: str, cohort_id: str, db: AsyncSession = Depends(
 
         formatted.append({
             "id": p.id,
-            "user_id": p.user_id, 
+            "username": p.username, 
             "audio_path": p.filename, 
             "script": script_data, 
             "topic": p.topic,
@@ -549,17 +540,17 @@ async def get_podcasts(user_id: str, cohort_id: str, db: AsyncSession = Depends(
 
 @app.post("/studio/podcast/generate")
 async def generate_podcast_endpoint(req: PodcastGenerateRequest, db: AsyncSession = Depends(get_db)):
-    await verify_user_enrollment(req.user_id, req.active_cohort_id, db)
-    if not await ensure_cohort_is_loaded(req.active_cohort_id, db):
+    await verify_user_enrollment(req.username, req.active_batch_id, db)
+    if not await ensure_batch_is_loaded(req.active_batch_id, db):
         raise HTTPException(status_code=400, detail="No documents indexed.")
 
     # --- SEMANTIC CACHE LOOKUP ---
     topic_with_level = f"{req.topic} [Level: {req.complexity}]"
     
     # AC-45: Rate Limit - Check for 3min cooldown
-    await check_cooldown(req.active_cohort_id, req.topic, "podcast")
+    await check_cooldown(req.active_batch_id, req.topic, "podcast")
 
-    cached_podcast = await get_semantic_cache(req.active_cohort_id, topic_with_level, "podcast")
+    cached_podcast = await get_semantic_cache(req.active_batch_id, topic_with_level, "podcast")
     
     # Validation: Ensure cache has the required script and the audio file actually exists on disk
     is_cache_valid = False
@@ -578,8 +569,8 @@ async def generate_podcast_endpoint(req: PodcastGenerateRequest, db: AsyncSessio
         audio_path = cached_podcast.get("audio_path") if isinstance(cached_podcast, dict) else None
         
         db.add(Podcast(
-            user_id=req.user_id, 
-            cohort_id=req.active_cohort_id, 
+            username=req.username, 
+            batch_id=req.active_batch_id, 
             filename=audio_path, 
             transcript=json.dumps(script_list), 
             topic=req.topic, 
@@ -597,20 +588,20 @@ async def generate_podcast_endpoint(req: PodcastGenerateRequest, db: AsyncSessio
 
     from celery_app import celery_app
     celery_app.send_task("generate_podcast_task", args=[
-        job_id, req.user_id, req.active_cohort_id, req.topic, req.complexity
+        job_id, req.username, req.active_batch_id, req.topic, req.complexity
     ])
 
     return JobResponse(job_id=job_id, status=JobStatus.PROCESSING, filename=req.topic)
 
-async def generate_podcast_background(job_id: str, user_id: str, cohort_id: str, topic: str, complexity: str):
+async def generate_podcast_background(job_id: str, username: str, batch_id: str, topic: str, complexity: str):
     try:
         # 1. Ensure metadata is ready
         async with AsyncSessionLocal() as db:
-            if not await ensure_cohort_is_loaded(cohort_id, db):
-                 raise RuntimeError("Cohort metadata not ready.")
+            if not await ensure_batch_is_loaded(batch_id, db):
+                 raise RuntimeError("Batch metadata not ready.")
 
         # 2. Fetch Metadata (RAM Singleton)
-        brain = await index_manager.get_brain(cohort_id)
+        brain = await index_manager.get_brain(batch_id)
         if not brain: raise RuntimeError("Course resources not found.")
         
         bm25 = brain["bm25"]
@@ -620,9 +611,9 @@ async def generate_podcast_background(job_id: str, user_id: str, cohort_id: str,
             topic=topic,
             bm25=bm25,
             graph=graph,
-            chunk_fetcher=lambda ids: fetch_chunk_details(ids, cohort_id),
+            chunk_fetcher=lambda ids: fetch_chunk_details(ids, batch_id),
             dense_retrieve_fn=dense_retrieve,
-            cohort_id=cohort_id,
+            batch_id=batch_id,
             complexity=complexity
         )
         
@@ -634,8 +625,8 @@ async def generate_podcast_background(job_id: str, user_id: str, cohort_id: str,
         # 3. Save to DB
         async with AsyncSessionLocal() as db:
             db.add(Podcast(
-                user_id=user_id, 
-                cohort_id=cohort_id, 
+                username=username, 
+                batch_id=batch_id, 
                 filename=podcast.audio_path, 
                 transcript=json.dumps(script_list), 
                 topic=topic, 
@@ -653,7 +644,7 @@ async def generate_podcast_background(job_id: str, user_id: str, cohort_id: str,
 
         # 4. Cache
         topic_with_level = f"{topic} [Level: {complexity}]"
-        await set_semantic_cache(cohort_id, topic_with_level, "podcast", {
+        await set_semantic_cache(batch_id, topic_with_level, "podcast", {
             "audio_path": podcast.audio_path,
             "script": script_list,
             "topic": topic,
@@ -663,7 +654,7 @@ async def generate_podcast_background(job_id: str, user_id: str, cohort_id: str,
     except PodcastRefusalError as pre:
         # AC-45: Security Gate refusal / No Info Found
         # Set a 3min cooldown to prevent spamming the same invalid topic
-        await set_cooldown(cohort_id, topic, "podcast")
+        await set_cooldown(batch_id, topic, "podcast")
         async with AsyncSessionLocal() as db:
             job_result = await db.execute(select(IngestionJob).where(IngestionJob.id == job_id))
             job = job_result.scalars().first()
@@ -675,7 +666,7 @@ async def generate_podcast_background(job_id: str, user_id: str, cohort_id: str,
     except ValueError as ve:
         # AC-45: Security Gate refusal / No Info Found
         # Set a 3min cooldown to prevent spamming the same invalid topic
-        await set_cooldown(cohort_id, topic, "podcast")
+        await set_cooldown(batch_id, topic, "podcast")
         async with AsyncSessionLocal() as db:
             job_result = await db.execute(select(IngestionJob).where(IngestionJob.id == job_id))
             job = job_result.scalars().first()
@@ -694,13 +685,12 @@ async def generate_podcast_background(job_id: str, user_id: str, cohort_id: str,
                 job.message = str(e)
                 await db.commit()
     finally:
-        from database import _db_proxy
-        await _db_proxy.get_engine().dispose()
+        await close_infra()
 
 # ===== DELETE STUDIO TOOLS =====
 @app.delete("/studio/flashcards")
-async def delete_flashcards(user_id: str, cohort_id: str, topic: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Flashcard).where(Flashcard.user_id == user_id, Flashcard.cohort_id == cohort_id))
+async def delete_flashcards(username: str, batch_id: str, topic: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Flashcard).where(Flashcard.username == username, Flashcard.batch_id == batch_id))
     records = result.scalars().all()
     
     deleted_any = False
@@ -720,9 +710,9 @@ async def delete_flashcards(user_id: str, cohort_id: str, topic: str, db: AsyncS
     return {"status": "not_found"}
 
 @app.delete("/studio/quiz")
-async def delete_quiz(user_id: str, cohort_id: str, topic: str, db: AsyncSession = Depends(get_db)):
+async def delete_quiz(username: str, batch_id: str, topic: str, db: AsyncSession = Depends(get_db)):
     # Since Quiz payload is a single object with a topic field
-    result = await db.execute(select(Quiz).where(Quiz.user_id == user_id, Quiz.cohort_id == cohort_id))
+    result = await db.execute(select(Quiz).where(Quiz.username == username, Quiz.batch_id == batch_id))
     records = result.scalars().all()
     
     deleted_any = False
@@ -737,8 +727,8 @@ async def delete_quiz(user_id: str, cohort_id: str, topic: str, db: AsyncSession
     return {"status": "not_found"}
 
 @app.delete("/studio/podcast")
-async def delete_podcast(user_id: str, cohort_id: str, topic: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Podcast).where(Podcast.user_id == user_id, Podcast.cohort_id == cohort_id, Podcast.topic == topic))
+async def delete_podcast(username: str, batch_id: str, topic: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Podcast).where(Podcast.username == username, Podcast.batch_id == batch_id, Podcast.topic == topic))
     records = result.scalars().all()
     
     if not records:
@@ -757,15 +747,15 @@ async def delete_podcast(user_id: str, cohort_id: str, topic: str, db: AsyncSess
     await db.commit()
     return {"status": "success"}
 # ===== SOURCES MANAGEMENT =====
-async def list_sources(cohort_id: Optional[str] = None):
+async def list_sources(batch_id: Optional[str] = None):
     all_stored = []
     try:
         from qdrant_client.models import Filter, FieldCondition, MatchValue
         
         scroll_filter = None
-        if cohort_id:
+        if batch_id:
             scroll_filter = Filter(
-                must=[FieldCondition(key="cohort_id", match=MatchValue(value=cohort_id))]
+                must=[FieldCondition(key="batch_id", match=MatchValue(value=batch_id))]
             )
 
         response = await qdrant.scroll(
@@ -791,8 +781,8 @@ async def list_sources(cohort_id: Optional[str] = None):
     return {"sources": all_stored}
 
 @app.get("/sources")
-async def list_sources_endpoint(cohort_id: Optional[str] = None):
-    return await list_sources(cohort_id)
+async def list_sources_endpoint(batch_id: Optional[str] = None):
+    return await list_sources(batch_id)
 
 class ActivateRequest(BaseModel):
     document_ids: List[str]
@@ -824,7 +814,7 @@ async def delete_source(document_id: str, db: AsyncSession = Depends(get_db)):
             raise HTTPException(status_code=404, detail="Source not found")
         
         doc_payload = points[0].payload
-        cohort_id = doc_payload.get("cohort_id") or doc_payload.get("metadata", {}).get("cohort_id")
+        batch_id = doc_payload.get("batch_id") or doc_payload.get("metadata", {}).get("batch_id")
         filename = doc_payload.get("metadata", {}).get("filename")
 
         # 2. Remove from Qdrant
@@ -834,20 +824,20 @@ async def delete_source(document_id: str, db: AsyncSession = Depends(get_db)):
         )
         
         # 3. Physical File Deletion
-        if cohort_id and filename:
-            target_file = UPLOAD_DIR / cohort_id / f"{document_id}_{filename}"
+        if batch_id and filename:
+            target_file = UPLOAD_DIR / batch_id / f"{document_id}_{filename}"
             if target_file.exists():
                 try:
                     target_file.unlink()
                 except: pass
 
         # 4. Invalidate Metadata in DB so it's re-built next time
-        if cohort_id:
-            result = await db.execute(select(Cohort).where(Cohort.id == cohort_id))
-            cohort = result.scalars().first()
-            if cohort:
-                cohort.bm25_data = None
-                cohort.graph_data = None
+        if batch_id:
+            result = await db.execute(select(Batch).where(Batch.id == batch_id))
+            batch = result.scalars().first()
+            if batch:
+                batch.bm25_data = None
+                batch.graph_data = None
                 await db.commit()
             
         return {"status": "success"}
@@ -860,9 +850,9 @@ async def clear_all_sources(db: AsyncSession = Depends(get_db)):
         await qdrant.delete_collection(QDRANT_COLLECTION)
         await qdrant.create_collection(collection_name=QDRANT_COLLECTION, vectors_config={"default": VectorParams(size=768, distance=Distance.COSINE)})
         
-        # Wipe all cohort metadata
+        # Wipe all batch metadata
         from sqlalchemy import update
-        await db.execute(update(Cohort).values(bm25_data=None, graph_data=None))
+        await db.execute(update(Batch).values(bm25_data=None, graph_data=None))
         await db.commit()
         
         return {"status": "success"}
@@ -882,7 +872,7 @@ def get_whisper_model():
         load_whisper_model()
     return _whisper_model
 
-async def dense_retrieve(query: str, cohort_id: str, top_k: int = 50) -> dict:
+async def dense_retrieve(query: str, batch_id: str, top_k: int = 50) -> dict:
     # AC-22: Use Batch Embedding Manager for efficient concurrent processing
     query_vec = await embedding_manager.get_embedding(query)
     
@@ -890,16 +880,16 @@ async def dense_retrieve(query: str, cohort_id: str, top_k: int = 50) -> dict:
     results = await qdrant.search(
         collection_name=QDRANT_COLLECTION, 
         query_vector=("default", query_vec), 
-        query_filter=Filter(must=[FieldCondition(key="cohort_id", match=MatchValue(value=cohort_id))]), 
+        query_filter=Filter(must=[FieldCondition(key="batch_id", match=MatchValue(value=batch_id))]), 
         limit=top_k, 
         with_payload=True
     )
     return {p.payload["chunk_id"]: float(p.score) for p in results if "chunk_id" in p.payload}
 
-async def fetch_chunk_details(chunk_ids: List[str], cohort_id: str = None) -> List[Dict]:
+async def fetch_chunk_details(chunk_ids: List[str], batch_id: str = None) -> List[Dict]:
     """
     Helper to fetch full chunk data from Qdrant by IDs.
-    AC-20: Security Hard-Lock - Always filter by cohort_id to prevent cross-tenant data leakage.
+    AC-20: Security Hard-Lock - Always filter by batch_id to prevent cross-tenant data leakage.
     """
     if not chunk_ids:
         return []
@@ -909,9 +899,9 @@ async def fetch_chunk_details(chunk_ids: List[str], cohort_id: str = None) -> Li
     # Base filter: match any of the requested chunk IDs
     must_conditions = [FieldCondition(key="chunk_id", match=MatchAny(any=chunk_ids))]
     
-    # Security Gate: If cohort_id is provided, enforce it strictly
-    if cohort_id:
-        must_conditions.append(FieldCondition(key="cohort_id", match=MatchValue(value=cohort_id)))
+    # Security Gate: If batch_id is provided, enforce it strictly
+    if batch_id:
+        must_conditions.append(FieldCondition(key="batch_id", match=MatchValue(value=batch_id)))
 
     response = await qdrant.scroll(
         collection_name=QDRANT_COLLECTION,
@@ -922,12 +912,12 @@ async def fetch_chunk_details(chunk_ids: List[str], cohort_id: str = None) -> Li
     points, _ = response
     return [p.payload for p in points]
 
-async def verify_user_enrollment(user_id: str, cohort_id: str, db: AsyncSession):
+async def verify_user_enrollment(username: str, batch_id: str, db: AsyncSession):
     """
     AC-24: Optimized Enrollment Verification with Redis Caching and DB Throttling.
     Eliminates redundant DB hits for every message.
     """
-    cache_key = f"enrollment:{user_id}:{cohort_id}"
+    cache_key = f"enrollment:{username}:{batch_id}"
     try:
         cached = await redis_client.get(cache_key)
         if cached == "1":
@@ -938,7 +928,7 @@ async def verify_user_enrollment(user_id: str, cohort_id: str, db: AsyncSession)
     # AC-26: Database Guard - only allow N physical connections at once
     async with db_semaphore:
         # Fallback to DB
-        result = await db.execute(select(UserEnrollment).where(UserEnrollment.user_id == user_id, UserEnrollment.cohort_id == cohort_id))
+        result = await db.execute(select(UserEnrollment).where(UserEnrollment.username == username, UserEnrollment.batch_id == batch_id))
         if not result.scalars().first(): 
             raise HTTPException(status_code=403, detail="Access Denied")
     
@@ -948,29 +938,29 @@ async def verify_user_enrollment(user_id: str, cohort_id: str, db: AsyncSession)
     except Exception as e:
         print(f"WARNING: Failed to set Redis enrollment cache: {e}")
 
-async def ensure_cohort_is_loaded(cohort_id: str, db: AsyncSession):
+async def ensure_batch_is_loaded(batch_id: str, db: AsyncSession):
     """
-    Checks if the cohort has its BM25/Graph metadata ready in Postgres.
+    Checks if the batch has its BM25/Graph metadata ready in Postgres.
     """
     # AC-26: Database Guard
     async with db_semaphore:
-        result = await db.execute(select(Cohort).where(Cohort.id == cohort_id))
-        cohort = result.scalars().first()
+        result = await db.execute(select(Batch).where(Batch.id == batch_id))
+        batch = result.scalars().first()
     
-    if not cohort or not cohort.bm25_data or not cohort.graph_data:
-        print(f"INFO: Cohort {cohort_id} metadata missing. Building from Qdrant...")
-        # 1. Scroll all chunks for this cohort
+    if not batch or not batch.bm25_data or not batch.graph_data:
+        print(f"INFO: Batch {batch_id} metadata missing. Building from Qdrant...")
+        # 1. Scroll all chunks for this batch
         from qdrant_client.models import Filter, FieldCondition, MatchValue
         response = await qdrant.scroll(
             collection_name=QDRANT_COLLECTION,
-            scroll_filter=Filter(must=[FieldCondition(key="cohort_id", match=MatchValue(value=cohort_id))]),
+            scroll_filter=Filter(must=[FieldCondition(key="batch_id", match=MatchValue(value=batch_id))]),
             limit=10000,
             with_payload=True
         )
         points, _ = response
         
         if not points:
-            print(f"WARN: No data found in Qdrant for cohort {cohort_id}")
+            print(f"WARN: No data found in Qdrant for batch {batch_id}")
             return False
 
         chunks = [p.payload for p in points]
@@ -980,30 +970,30 @@ async def ensure_cohort_is_loaded(cohort_id: str, db: AsyncSession):
         new_graph = await asyncio.to_thread(build_chunk_graph, chunks)
         
         # 3. Save to DB
-        if not cohort:
-            cohort = Cohort(id=cohort_id, name=f"Course {cohort_id}")
-            db.add(cohort)
+        if not batch:
+            batch = Batch(id=batch_id, name=f"Course {batch_id}")
+            db.add(batch)
         
-        cohort.bm25_data = new_bm25.to_dict()
-        cohort.graph_data = new_graph
+        batch.bm25_data = new_bm25.to_dict()
+        batch.graph_data = new_graph
         await db.commit()
         
-        print(f"SUCCESS: Built and persisted stateless metadata for cohort {cohort_id}.")
+        print(f"SUCCESS: Built and persisted stateless metadata for batch {batch_id}.")
         return True
     
     return True
 
 # ===== API MODELS =====
 class UserLogin(BaseModel):
-    email: str # Username
+    username: str # Unified Username
 
-class SwitchCohortRequest(BaseModel):
-    user_id: str
-    cohort_id: str
+class SwitchBatchRequest(BaseModel):
+    username: str
+    batch_id: str
 
 class ChatRequest(BaseModel):
-    user_id: str
-    active_cohort_id: str
+    username: str
+    active_batch_id: str
     message: str = Field(..., min_length=1)
     complexity: str = Field("Undergrad", description="Complexity level: 5-Year-Old, High School, Undergrad, PhD Expert")
     tutor_mode: bool = Field(False, description="Enable Socratic Tutor mode")
@@ -1033,7 +1023,7 @@ class JobResponse(BaseModel):
 
 class YoutubeIngestRequest(BaseModel):
     url: str      
-    cohort_id: str = "default_cohort"
+    batch_id: str = "default_batch"
     document_id: str | None = None
 class WebIngestMode(str, Enum):
     SINGLE = "single"                                                                                           
@@ -1041,21 +1031,21 @@ class WebIngestMode(str, Enum):
     SITEMAP = "sitemap"                                                                                                                                                                                            
 class WebIngestRequest(BaseModel):                                                                              
     url: str                                                                                                    
-    cohort_id: str = "default_cohort"                                                                           
+    batch_id: str = "default_batch"                                                                           
     document_id: str | None = None                                                                              
     mode: WebIngestMode = WebIngestMode.SINGLE 
 class UniversalURLRequest(BaseModel):
     url: str
-    cohort_id: str = "default_cohort"
+    batch_id: str = "default_batch"
     document_id: str | None = None
     mode: str = "single"
     filename: Optional[str] = None
 class BatchUrlRequest(BaseModel):
     urls: List[str]
-    cohort_id: str = "default_cohort"
+    batch_id: str = "default_batch"
 
 # ===== BACKGROUND WORKER & INGESTION =====
-async def process_ingestion_background(job_id: str, input_path: str, file_type: str, ingestion_id: str, file_id: str, filename: str, cohort_id: str, mode: str = "single"):
+async def process_ingestion_background(job_id: str, input_path: str, file_type: str, ingestion_id: str, file_id: str, filename: str, batch_id: str, mode: str = "single"):
     try:
         from urllib.parse import urlparse
         import httpx
@@ -1095,11 +1085,11 @@ async def process_ingestion_background(job_id: str, input_path: str, file_type: 
                 from urllib.parse import unquote
                 url_filename = Path(urlparse(input_path).path).name or f"remote_file{file_type}"
                 
-                # COHORT ISOLATION: Nest file in cohort directory
-                cohort_dir = UPLOAD_DIR / cohort_id
-                cohort_dir.mkdir(parents=True, exist_ok=True)
+                # BATCH ISOLATION: Nest file in batch directory
+                batch_dir = UPLOAD_DIR / batch_id
+                batch_dir.mkdir(parents=True, exist_ok=True)
                 
-                local_file = cohort_dir / f"{file_id}_{uuid4().hex[:6]}_{unquote(url_filename)}"
+                local_file = batch_dir / f"{file_id}_{uuid4().hex[:6]}_{unquote(url_filename)}"
                 async with httpx.AsyncClient(follow_redirects=True) as client:
                     download_resp = await client.get(input_path)
                     download_resp.raise_for_status()
@@ -1136,9 +1126,9 @@ async def process_ingestion_background(job_id: str, input_path: str, file_type: 
             blocks = [{"block_id": rb.block_id, "block_type": rb.block_type, "text": rb.text, "document_id": file_id, "page": 1, "metadata": {**rb.metadata}} for rb in raw_blocks if rb.block_type != "error"]
         
         for b in blocks:
-            b["cohort_id"] = cohort_id
+            b["batch_id"] = batch_id
             if "metadata" not in b: b["metadata"] = {}
-            b["metadata"]["cohort_id"] = cohort_id
+            b["metadata"]["batch_id"] = batch_id
             b["metadata"]["filename"] = filename
             b["metadata"]["ingested_at"] = int(time.time())
         t_extraction = time.time()
@@ -1149,9 +1139,9 @@ async def process_ingestion_background(job_id: str, input_path: str, file_type: 
         else: chunks = await asyncio.to_thread(semantic_chunk_blocks, blocks)
         
         for c in chunks:
-            c["cohort_id"] = cohort_id
+            c["batch_id"] = batch_id
             if "metadata" not in c: c["metadata"] = {}
-            c["metadata"]["cohort_id"] = cohort_id
+            c["metadata"]["batch_id"] = batch_id
             c["metadata"]["filename"] = filename
             c["metadata"]["ingested_at"] = int(time.time())
         t_chunking = time.time()
@@ -1193,38 +1183,38 @@ async def process_ingestion_background(job_id: str, input_path: str, file_type: 
             print(f"   -> Phase 4 & 5 Skipped (No eligible text, Total: {t_upsert - t_start:.2f}s)")
             
         # STATELESS TRANSITION: Re-build and Persist Metadata to Postgres
-        # We fetch ALL chunks for this cohort to ensure the BM25/Graph is complete
+        # We fetch ALL chunks for this batch to ensure the BM25/Graph is complete
         print(f"[INGESTION PHASE 6/6] Metadata & Index Building")
         from qdrant_client.models import Filter, FieldCondition, MatchValue
         response = await qdrant.scroll(
             collection_name=QDRANT_COLLECTION,
-            scroll_filter=Filter(must=[FieldCondition(key="cohort_id", match=MatchValue(value=cohort_id))]),
+            scroll_filter=Filter(must=[FieldCondition(key="batch_id", match=MatchValue(value=batch_id))]),
             limit=10000,
             with_payload=True
         )
-        all_cohort_points = response[0]
-        all_cohort_chunks = [p.payload for p in all_cohort_points]
+        all_batch_points = response[0]
+        all_batch_chunks = [p.payload for p in all_batch_points]
         
         async with AsyncSessionLocal() as db:
-            if all_cohort_chunks:
-                new_bm25 = await asyncio.to_thread(BM25ChunkIndex, all_cohort_chunks)
-                new_graph = await asyncio.to_thread(build_chunk_graph, all_cohort_chunks)
+            if all_batch_chunks:
+                new_bm25 = await asyncio.to_thread(BM25ChunkIndex, all_batch_chunks)
+                new_graph = await asyncio.to_thread(build_chunk_graph, all_batch_chunks)
                 
-                result = await db.execute(select(Cohort).where(Cohort.id == cohort_id))
-                cohort = result.scalars().first()
-                if not cohort:
-                    cohort = Cohort(id=cohort_id, name=f"Course {cohort_id}")
-                    db.add(cohort)
+                result = await db.execute(select(Batch).where(Batch.id == batch_id))
+                batch = result.scalars().first()
+                if not batch:
+                    batch = Batch(id=batch_id, name=f"Course {batch_id}")
+                    db.add(batch)
                 
-                cohort.bm25_data = new_bm25.to_dict()
-                cohort.graph_data = new_graph
+                batch.bm25_data = new_bm25.to_dict()
+                batch.graph_data = new_graph
                 await db.commit()
                 
                 # IMS INVALIDATION: Clear RAM singleton so next request loads fresh data
-                await index_manager.invalidate_cohort(cohort_id)
+                await index_manager.invalidate_batch(batch_id)
                 
                 # CACHE INVALIDATION: Clear Redis so chat uses the new index
-                await redis_client.delete(f"cohort_meta:{cohort_id}")
+                await redis_client.delete(f"batch_meta:{batch_id}")
                 t_metadata = time.time()
                 print(f"   -> Phase 6 Completed in {t_metadata - t_upsert:.2f}s (Total: {t_metadata - t_start:.2f}s)")
                 print(f"SUCCESS: Ingestion total time: {t_metadata - t_start:.2f}s\n")
@@ -1249,13 +1239,12 @@ async def process_ingestion_background(job_id: str, input_path: str, file_type: 
                 await db.commit()
     finally:
         if mode == "single":
-            from database import _db_proxy
-            await _db_proxy.get_engine().dispose()
+            await close_infra()
 
-async def process_batch_ingestion_background(job_id: str, urls: List[str], cohort_id: str):
+async def process_batch_ingestion_background(job_id: str, urls: List[str], batch_id: str):
     try:
         for i, url in enumerate(urls):
-            await process_ingestion_background(job_id, url, "url_auto", uuid4().hex[:8], f"url_{uuid4().hex[:8]}", url, cohort_id, mode="batch")
+            await process_ingestion_background(job_id, url, "url_auto", uuid4().hex[:8], f"url_{uuid4().hex[:8]}", url, batch_id, mode="batch")
         
         async with AsyncSessionLocal() as db:
             job_result = await db.execute(select(IngestionJob).where(IngestionJob.id == job_id))
@@ -1273,8 +1262,7 @@ async def process_batch_ingestion_background(job_id: str, urls: List[str], cohor
                 job.message = f"Batch failed: {str(e)}"
                 await db.commit()
     finally:
-        from database import _db_proxy
-        await _db_proxy.get_engine().dispose()
+        await close_infra()
 
 @app.get("/jobs/{job_id}", response_model=JobResponse)
 async def get_job_status(job_id: str, db: AsyncSession = Depends(get_db)):
@@ -1302,7 +1290,7 @@ async def ingest_youtube(req: YoutubeIngestRequest, db: AsyncSession = Depends(g
     await db.commit()
     
     from celery_app import celery_app
-    celery_app.send_task("process_ingestion", args=[job_id, req.url, "youtube", uuid4().hex[:8], file_id, req.url, req.cohort_id, "single"])
+    celery_app.send_task("process_ingestion", args=[job_id, req.url, "youtube", uuid4().hex[:8], file_id, req.url, req.batch_id, "single"])
     
     return JobResponse(job_id=job_id, status=JobStatus.PROCESSING, filename=req.url)
 
@@ -1316,7 +1304,7 @@ async def ingest_web(req: WebIngestRequest, db: AsyncSession = Depends(get_db)):
     await db.commit()
     
     from celery_app import celery_app
-    celery_app.send_task("process_ingestion", args=[job_id, req.url, "web", uuid4().hex[:8], file_id, req.url, req.cohort_id, req.mode.value])
+    celery_app.send_task("process_ingestion", args=[job_id, req.url, "web", uuid4().hex[:8], file_id, req.url, req.batch_id, req.mode.value])
     
     return JobResponse(job_id=job_id, status=JobStatus.PROCESSING, filename=req.url)
 
@@ -1333,7 +1321,7 @@ async def ingest_universal_url(req: UniversalURLRequest, db: AsyncSession = Depe
     
     # 2. Dispatch to Celery Queue
     from celery_app import celery_app
-    celery_app.send_task("process_ingestion", args=[job_id, req.url, "url_auto", uuid4().hex[:8], file_id, filename, req.cohort_id, req.mode])
+    celery_app.send_task("process_ingestion", args=[job_id, req.url, "url_auto", uuid4().hex[:8], file_id, filename, req.batch_id, req.mode])
     
     return JobResponse(job_id=job_id, status=JobStatus.PROCESSING, filename=filename)
 
@@ -1346,20 +1334,20 @@ async def ingest_batch_urls(req: BatchUrlRequest, db: AsyncSession = Depends(get
     await db.commit()
     
     from celery_app import celery_app
-    celery_app.send_task("process_batch_ingestion", args=[job_id, req.urls, req.cohort_id])
+    celery_app.send_task("process_batch_ingestion", args=[job_id, req.urls, req.batch_id])
     
     return JobResponse(job_id=job_id, status=JobStatus.PROCESSING, filename="Batch")
 
 @app.post("/upload", response_model=JobResponse)
-async def upload_file(file: UploadFile = File(...), cohort_id: str = "default_cohort", db: AsyncSession = Depends(get_db)):
+async def upload_file(file: UploadFile = File(...), batch_id: str = "default_batch", db: AsyncSession = Depends(get_db)):
     job_id = f"job_{uuid4().hex[:8]}"
     file_id = str(uuid4())
     
-    # COHORT ISOLATION: Create subdirectory
-    cohort_dir = UPLOAD_DIR / cohort_id
-    cohort_dir.mkdir(parents=True, exist_ok=True)
+    # BATCH ISOLATION: Create subdirectory
+    batch_dir = UPLOAD_DIR / batch_id
+    batch_dir.mkdir(parents=True, exist_ok=True)
     
-    file_path = cohort_dir / f"{file_id}_{file.filename}"
+    file_path = batch_dir / f"{file_id}_{file.filename}"
     with open(file_path, "wb") as f: f.write(await file.read())
     
     new_job = IngestionJob(id=job_id, status=JobStatus.PROCESSING.value, filename=file.filename, document_id=file_id)
@@ -1367,169 +1355,155 @@ async def upload_file(file: UploadFile = File(...), cohort_id: str = "default_co
     await db.commit()
     
     from celery_app import celery_app
-    celery_app.send_task("process_ingestion", args=[job_id, str(file_path), Path(file.filename).suffix.lower(), uuid4().hex[:8], file_id, file.filename, cohort_id, "single"])
+    celery_app.send_task("process_ingestion", args=[job_id, str(file_path), Path(file.filename).suffix.lower(), uuid4().hex[:8], file_id, file.filename, batch_id, "single"])
     
     return JobResponse(job_id=job_id, status=JobStatus.PROCESSING, filename=file.filename)
 
 # ===== AUTH ENDPOINTS =====
 @app.post("/auth/login")
 async def login(req: UserLogin, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.email == req.email))
+    result = await db.execute(select(User).where(User.username == req.username))
     user = result.scalars().first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found. Please wait for sync.")
     
-    # Enrich cohort data with friendly names
+    # Enrich batch data with friendly names
     e_res = await db.execute(
-        select(Cohort.id, Cohort.name)
-        .join(UserEnrollment, UserEnrollment.cohort_id == Cohort.id)
-        .where(UserEnrollment.user_id == user.id)
+        select(Batch.id, Batch.name)
+        .join(UserEnrollment, UserEnrollment.batch_id == Batch.id)
+        .where(UserEnrollment.username == user.username)
     )
     enrolled_data = [{"id": r[0], "name": r[1]} for r in e_res.all()]
-    cohort_ids = [c["id"] for c in enrolled_data]
+    batch_ids = [c["id"] for c in enrolled_data]
     
     # If user has no enrollments yet, we return empty list
-    active_cohort = user.last_active_cohort_id
-    if not active_cohort and cohort_ids:
-        active_cohort = cohort_ids[0]
+    active_batch = user.last_active_batch_id
+    if not active_batch and batch_ids:
+        active_batch = batch_ids[0]
         
     return {
         "status": "success", 
-        "user_id": user.id, 
-        "active_cohort_id": active_cohort, 
-        "enrolled_cohorts": enrolled_data
+        "username": user.username, 
+        "active_batch_id": active_batch, 
+        "enrolled_batches": enrolled_data
     }
 
-@app.post("/auth/switch-cohort")
-async def switch_cohort(req: SwitchCohortRequest, db: AsyncSession = Depends(get_db)):
+@app.post("/auth/switch-batch")
+async def switch_batch(req: SwitchBatchRequest, db: AsyncSession = Depends(get_db)):
     # 1. Verify enrollment exists
-    e_res = await db.execute(select(UserEnrollment).where(UserEnrollment.user_id == req.user_id, UserEnrollment.cohort_id == req.cohort_id))
+    e_res = await db.execute(select(UserEnrollment).where(UserEnrollment.username == req.username, UserEnrollment.batch_id == req.batch_id))
     if not e_res.scalars().first():
-        raise HTTPException(status_code=403, detail="User not enrolled in this cohort")
+        raise HTTPException(status_code=403, detail="User not enrolled in this batch")
     
     # 2. Update last active
-    result = await db.execute(select(User).where(User.id == req.user_id))
+    result = await db.execute(select(User).where(User.username == req.username))
     user = result.scalars().first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
         
-    user.last_active_cohort_id = req.cohort_id
+    user.last_active_batch_id = req.batch_id
     await db.commit()
     
-    return {"status": "success", "active_cohort_id": req.cohort_id}
+    return {"status": "success", "active_batch_id": req.batch_id}
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
     t_start = time.time()
-    print(f"\n[INFERENCE] Starting Chat Inference for user {req.user_id}")
+    print(f"\n[INFERENCE] Starting Chat Inference for user {req.username}")
     
     # AC-45: Rate Limit - Check for 3min cooldown
-    await check_cooldown(req.active_cohort_id, req.message, "chat")
+    await check_cooldown(req.active_batch_id, req.message, "chat")
 
-    t_verify_start = time.perf_counter()
-    await verify_user_enrollment(req.user_id, req.active_cohort_id, db)
-    print(f"      - User Enrollment Verification: {time.perf_counter() - t_verify_start:.4f}s")
+    await verify_user_enrollment(req.username, req.active_batch_id, db)
     
     # 1. Ensure metadata is ready
-    t_metadata_ready_start = time.perf_counter()
-    if not await ensure_cohort_is_loaded(req.active_cohort_id, db):
-        return ChatResponse(reply="Currently we do not have the specific resources to answer this question.", citations=[])
-    t_metadata_ready_end = time.perf_counter()
-    print(f"      - Internal Validation (ensure_cohort): {t_metadata_ready_end - t_metadata_ready_start:.4f}s")
-    
-    # --- SEMANTIC CACHE LOOKUP ---
-    t_cache_start = time.perf_counter()
-    query_with_level = f"{req.message} [Level: {req.complexity}]"
-    cached_reply = await get_semantic_cache(req.active_cohort_id, query_with_level, "chat")
-    t_cache_end = time.perf_counter()
-    print(f"      - Semantic Cache Lookup: {t_cache_end - t_cache_start:.4f}s")
-    
-    if cached_reply:
-        print(f"   -> Inference Completed via Cache in {time.time() - t_start:.2f}s")
-        return ChatResponse(reply=cached_reply["reply"], citations=cached_reply.get("citations", []))
-
-    # 2. Fetch Metadata (with RAM Singleton Optimization)
-    print(f"[INFERENCE PHASE 1/4] Metadata Loading")
-    t_ims_start = time.perf_counter()
-    brain = await index_manager.get_brain(req.active_cohort_id)
-    t_ims_end = time.perf_counter()
-    print(f"      - IMS RAM Brain Retrieval: {t_ims_end - t_ims_start:.4f}s")
-    if not brain:
+    if not await ensure_batch_is_loaded(req.active_batch_id, db):
         return ChatResponse(reply="Currently we do not have the specific resources to answer this question.", citations=[])
     
-    bm25 = brain["bm25"]
-    graph = brain["graph"]
+    # --- TIER 1: FULL RESPONSE CACHE (LLM BYPASS) ---
+    response_filters = {"complexity": req.complexity, "tutor_mode": str(req.tutor_mode)}
+    cached_response = await get_semantic_cache(req.active_batch_id, req.message, "chat_response", filters=response_filters)
     
-    t_metadata = time.time()
-    print(f"   -> Phase 1 Completed in {t_metadata - t_start:.2f}s (Total: {t_metadata - t_start:.2f}s)")
+    if cached_response:
+        print(f"   -> [TIER 1 HIT] Inference Bypassed via Response Cache in {time.time() - t_start:.2f}s")
+        return ChatResponse(reply=cached_response["reply"], citations=cached_response.get("citations", []))
 
-    # 3. Retrieval
-    print(f"[INFERENCE PHASE 2/4] Query Rewriting")
-    rewrite_result = await rewrite_query_ensemble(query=req.message, call_llm_fn=call_gemini_async)
-    t_rewrite = time.time()
-    print(f"   -> Phase 2 Completed in {t_rewrite - t_metadata:.2f}s (Total: {t_rewrite - t_start:.2f}s)")
+    # --- TIER 2: KNOWLEDGE CONTEXT CACHE (RETRIEVAL BYPASS) ---
+    candidates = None
+    cached_context = await get_semantic_cache(req.active_batch_id, req.message, "chat_context")
     
-    print(f"[INFERENCE PHASE 3/4] Retrieval & Reranking")
-    candidates = await retrieve_candidates(
-        query=req.message, 
-        rewrites=rewrite_result["rewrites"], 
-        bm25=bm25,
-        graph=graph,
-        chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_cohort_id),
-        dense_fn=dense_retrieve, 
-        cohort_id=req.active_cohort_id, 
-        min_dense_score=req.min_dense_score,
-        t_inference_start=t_start
-    )
-    t_retrieval = time.time()
-    print(f"   -> Phase 3 Completed in {t_retrieval - t_rewrite:.2f}s (Candidates: {len(candidates)}, Total: {t_retrieval - t_start:.2f}s)")
-    
+    if cached_context:
+        print(f"   -> [TIER 2 HIT] Retrieval Bypassed via Context Cache")
+        candidates = cached_context
+    else:
+        # 2. Fetch Metadata (IMS RAM Brain)
+        brain = await index_manager.get_brain(req.active_batch_id)
+        if not brain:
+            return ChatResponse(reply="Currently we do not have the specific resources to answer this question.", citations=[])
+        
+        bm25 = brain["bm25"]
+        graph = brain["graph"]
+
+        # 3. Full Retrieval Pipeline
+        print(f"[INFERENCE PHASE 2/4] Query Rewriting")
+        rewrite_result = await rewrite_query_ensemble(query=req.message, call_llm_fn=call_gemini_async)
+        
+        print(f"[INFERENCE PHASE 3/4] Retrieval & Reranking")
+        candidates = await retrieve_candidates(
+            query=req.message, 
+            rewrites=rewrite_result["rewrites"], 
+            bm25=bm25,
+            graph=graph,
+            chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_batch_id),
+            dense_fn=dense_retrieve, 
+            batch_id=req.active_batch_id, 
+            min_dense_score=req.min_dense_score,
+            t_inference_start=t_start
+        )
+        
+        if candidates:
+            # Save to Context Cache (Background) - Available for ANY complexity level
+            asyncio.create_task(set_semantic_cache(req.active_batch_id, req.message, "chat_context", candidates))
+
     if not candidates: 
-        return ChatResponse(reply="Currently we do not have the specific resources to answer this question.", citations=[])
+        return ChatResponse(reply="Currently we do not have the answer for this question.", citations=[])
     
-    # Build Prompt with Complexity and Tutor Mode
-    print(f"[INFERENCE PHASE 4/4] Response Generation")
-    t_gen_start = time.time()
-    
+    # 4. Response Generation
+    print(f"[INFERENCE PHASE 4/4] Response Generation (Complexity: {req.complexity})")
     complexity_instr = COMPLEXITY_MAP.get(req.complexity, COMPLEXITY_MAP["Undergrad"])
     tutor_instr = TUTOR_PROMPT if req.tutor_mode else "Answer clearly based on the context."
-    context = "\n\n".join(f"[DOC_ID: {c['doc_id']}]\n{c['text']}" for c in candidates)
+    context_text = "\n\n".join(f"[DOC_ID: {c['doc_id']}]\n{c['text']}" for c in candidates)
     
     final_prompt = f"""
 Instructions:
 - {complexity_instr}
 - {tutor_instr}
-- Use only the provided context to answer the question. Do not use any external knowledge or make assumptions.
-- If the context does not contain enough information to answer the question with > 0.8 confidence, say only "Currently we do not have the answer for this question." Do not attempt to answer based on guesswork or include any other noise.
-- Always cite your sources by [DOC_ID: id] at the end of relevant points.
+- Use only the provided context to answer the question. Do not use any external knowledge.
+- If context is insufficient, say only "Currently we do not have the answer for this question."
+- Always cite your sources by [DOC_ID: id].
 Context:
-{context}
+{context_text}
 Question: {req.message}
 """.strip()
 
-    t_prompt_ready = time.time()
-    print(f"      - Prompt constructed in {t_prompt_ready - t_gen_start:.4f}s (Length: {len(final_prompt)} chars)")
-    
-    print(f"      - Requesting Gemini AI response...")
     reply = await call_gemini_async(final_prompt)
-    t_gen_done = time.time()
-    print(f"      - Gemini AI responded in {t_gen_done - t_prompt_ready:.2f}s")
-
-    t_end = time.time()
-    print(f"   -> Phase 4 Completed in {t_end - t_retrieval:.2f}s (Total: {t_end - t_start:.2f}s)")
     
-    # Extract citations from reply text if needed
+    # Extract citations
     doc_ids = list(set([c['doc_id'] for c in candidates]))
     found_citations = [did for did in doc_ids if f"[DOC_ID: {did}]" in reply]
     
-    # --- SAVE TO SEMANTIC CACHE (Background) ---
+    # --- SAVE TO TIER 1 CACHE (Background) ---
     NO_INFO_MSG = "Currently we do not have the answer for this question."
-    if reply.strip() == NO_INFO_MSG:
-        # AC-45: Negative Cache / Cooldown
-        await set_cooldown(req.active_cohort_id, req.message, "chat")
+    if reply.strip() != NO_INFO_MSG:
+        asyncio.create_task(set_semantic_cache(
+            req.active_batch_id, 
+            req.message, 
+            "chat_response", 
+            {"reply": reply, "citations": found_citations},
+            metadata={"complexity": req.complexity, "tutor_mode": str(req.tutor_mode)}
+        ))
     else:
-        # Only cache proper answers
-        asyncio.create_task(set_semantic_cache(req.active_cohort_id, query_with_level, "chat", {"reply": reply, "citations": found_citations}))
+        await set_cooldown(req.active_batch_id, req.message, "chat")
 
-    print(f"SUCCESS: Total Inference Time: {t_end - t_start:.2f}s\n")
+    print(f"SUCCESS: Total Inference Time: {time.time() - t_start:.2f}s\n")
     return ChatResponse(reply=reply, citations=found_citations)

@@ -37,7 +37,7 @@ async def generate_quiz_for_topic(
     chunk_fetcher: Callable,
     dense_retrieve_fn: Callable, 
     call_gemini_fn: Optional[Callable[[str], Awaitable[str]]] = None,
-    cohort_id: str = "default_cohort",
+    batch_id: str = "default_batch",
     complexity: str = "Undergrad"
 ) -> Optional[Quiz]:
     """
@@ -67,7 +67,7 @@ async def generate_quiz_for_topic(
             graph=graph,
             chunk_fetcher=chunk_fetcher,
             dense_fn=dense_retrieve_fn,
-            cohort_id=cohort_id,
+            batch_id=batch_id,
             dense_top_k=50,
             max_candidates=6,
             min_dense_score=0.30,

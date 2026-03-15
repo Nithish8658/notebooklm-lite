@@ -33,7 +33,7 @@ function Chat() {
     setLoading(true);
 
     try {
-      const reply = await sendMessage(user.user_id, user.active_cohort_id, userMessage, complexity, tutorMode);
+      const reply = await sendMessage(user.username, user.active_batch_id, userMessage, complexity, tutorMode);
       setMessages(prev => [...prev, { role: "bot", text: reply }]);
     } catch (err) {
       setMessages(prev => [
