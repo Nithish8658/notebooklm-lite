@@ -12,7 +12,7 @@ function SourceManagement() {
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      const sourceData = await fetchSources(user?.active_cohort_id);
+      const sourceData = await fetchSources(user?.active_batch_id);
       setSources(sourceData);
       const metricsData = await fetchMetrics();
       setMetrics(metricsData);
@@ -21,7 +21,7 @@ function SourceManagement() {
     } finally {
       setLoading(false);
     }
-  }, [user?.active_cohort_id]);
+  }, [user?.active_batch_id]);
 
   useEffect(() => {
     loadData();

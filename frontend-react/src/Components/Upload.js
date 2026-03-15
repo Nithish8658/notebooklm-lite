@@ -5,14 +5,14 @@ import { useGlobalState } from "../GlobalState";
 function Upload() {
   const { user, uploadStatus: status, setUploadStatus: setStatus } = useGlobalState();
   const [file, setFile] = useState(null);
-  const [cohortId, setCohortId] = useState(user?.active_cohort_id || "default_cohort");
+  const [batchId, setBatchId] = useState(user?.active_batch_id || "default_batch");
 
-  // Sync cohortId if active context changes
+  // Sync batchId if active context changes
   useEffect(() => {
-    if (user?.active_cohort_id) {
-      setCohortId(user.active_cohort_id);
+    if (user?.active_batch_id) {
+      setBatchId(user.active_batch_id);
     }
-  }, [user?.active_cohort_id]);
+  }, [user?.active_batch_id]);
 
   const handleFileChange = (e) => {
     const selectedFile = e.target.files[0];
@@ -48,7 +48,7 @@ function Upload() {
 
     try {
       setStatus("Uploading and analyzing file...");
-      const result = await uploadDocument(file, cohortId);
+      const result = await uploadDocument(file, batchId);
       setStatus(`Success: ${result.filename} indexed!`);
       setFile(null);
     } catch (err) {
@@ -61,12 +61,12 @@ function Upload() {
       <h3>Add Files (PDF / PPT / Video / Excel)</h3>
 
       <div style={{ marginBottom: '10px' }}>
-        <label style={{ fontSize: '0.8rem', color: '#666', display: 'block', marginBottom: '4px' }}>Target Cohort ID</label>
+        <label style={{ fontSize: '0.8rem', color: '#666', display: 'block', marginBottom: '4px' }}>Target Batch ID</label>
         <input 
           type="text" 
-          value={cohortId} 
-          onChange={(e) => setCohortId(e.target.value)}
-          placeholder="Cohort ID"
+          value={batchId} 
+          onChange={(e) => setBatchId(e.target.value)}
+          placeholder="Batch ID"
           style={{ 
             width: '100%', 
             padding: '6px', 

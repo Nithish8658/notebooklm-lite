@@ -25,7 +25,7 @@ async def generate_flashcards(
     bm25: Optional[BM25ChunkIndex],
     graph: Dict,
     chunk_fetcher: Callable,
-    cohort_id: str,
+    batch_id: str,
     limit: int = 15,
     dense_retrieve_fn: Optional[Callable] = None,
     call_gemini_fn: Optional[Callable] = None,
@@ -61,7 +61,7 @@ async def generate_flashcards(
                 graph=graph,
                 chunk_fetcher=chunk_fetcher,
                 dense_fn=dense_retrieve_fn,
-                cohort_id=cohort_id,
+                batch_id=batch_id,
                 max_candidates=15,
                 min_dense_score=0.30 # AC-35: Enforce Chat-level precision
             )

@@ -1,0 +1,321 @@
+{
+	"info": {
+		"_postman_id": "a1b2c3d4-e5f6-4g7h-8i9j-k0l1m2n3o4p5",
+		"name": "NotebookLM Lite",
+		"description": "API collection for NotebookLM Lite",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "Auth",
+			"item": [
+				{
+					"name": "Login",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"username\": \"user@example.com\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/auth/login",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"auth",
+								"login"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Switch Batch",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"username\": \"{{username}}\",\n    \"batch_id\": \"{{batch_id}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/auth/switch-batch",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"auth",
+								"switch-batch"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Chat",
+			"item": [
+				{
+					"name": "Send Message",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"username\": \"{{username}}\",\n    \"active_batch_id\": \"{{batch_id}}\",\n    \"message\": \"What is this document about?\",\n    \"complexity\": \"Undergrad\",\n    \"tutor_mode\": false\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/chat",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"chat"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Ingestion",
+			"item": [
+				{
+					"name": "Upload File",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "formdata",
+							"formdata": [
+								{
+									"key": "file",
+									"type": "file",
+									"src": []
+								}
+							]
+						},
+						"url": {
+							"raw": "{{baseUrl}}/upload?batch_id={{batch_id}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"upload"
+							],
+							"query": [
+								{
+									"key": "batch_id",
+									"value": "{{batch_id}}"
+								}
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Ingest YouTube",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"url\": \"https://www.youtube.com/watch?v=dQw4w9WgXcQ\",\n    \"batch_id\": \"{{batch_id}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/ingest/youtube",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"ingest",
+								"youtube"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Ingest Web",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"url\": \"https://en.wikipedia.org/wiki/Artificial_intelligence\",\n    \"batch_id\": \"{{batch_id}}\",\n    \"mode\": \"single\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/ingest/web",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"ingest",
+								"web"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Job Status",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/jobs/:job_id",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"jobs",
+								":job_id"
+							],
+							"variable": [
+								{
+									"key": "job_id",
+									"value": "job_12345"
+								}
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Studio",
+			"item": [
+				{
+					"name": "Generate Flashcards",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"username\": \"{{username}}\",\n    \"active_batch_id\": \"{{batch_id}}\",\n    \"topics\": [\"AI\", \"History\"],\n    \"complexity\": \"Undergrad\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/studio/flashcards",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"studio",
+								"flashcards"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Generate Quiz",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"username\": \"{{username}}\",\n    \"active_batch_id\": \"{{batch_id}}\",\n    \"topic\": \"Machine Learning\",\n    \"complexity\": \"Undergrad\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/studio/quiz/generate",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"studio",
+								"quiz",
+								"generate"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Generate Podcast",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"username\": \"{{username}}\",\n    \"active_batch_id\": \"{{batch_id}}\",\n    \"topic\": \"The future of AI\",\n    \"complexity\": \"Undergrad\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/studio/podcast/generate",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"studio",
+								"podcast",
+								"generate"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		}
+	],
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:8000",
+			"type": "string"
+		},
+		{
+			"key": "username",
+			"value": "YOUR_USERNAME",
+			"type": "string"
+		},
+		{
+			"key": "batch_id",
+			"value": "default_batch",
+			"type": "string"
+		}
+	]
+}

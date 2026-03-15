@@ -19,7 +19,7 @@ async def retrieve_candidates(
     graph: Dict,
     chunk_fetcher: Callable[[List[str]], Awaitable[List[Dict]]], # Callback to fetch chunk details from Qdrant
     dense_fn,
-    cohort_id: str,
+    batch_id: str,
     sparse_top_k: int = 40,
     dense_top_k: int = 60,
     alpha: float = 0.45,
@@ -60,7 +60,7 @@ async def retrieve_candidates(
 
         # ---- Dense (Async) ----
         try:
-            raw_dense = await dense_fn(q, cohort_id=cohort_id, top_k=dense_top_k)
+            raw_dense = await dense_fn(q, batch_id=batch_id, top_k=dense_top_k)
         except Exception as e:
             _LOG.error("dense_fn failed for %s: %s", q, e)
             raw_dense = {}
@@ -75,7 +75,7 @@ async def retrieve_candidates(
         
         # ---- Sparse (Sync In-Memory per Request) ----
         sparse_scores = (
-            bm25.search(q, cohort_id=cohort_id, top_k=sparse_top_k)
+            bm25.search(q, batch_id=batch_id, top_k=sparse_top_k)
             if bm25
             else {}
         )
@@ -155,16 +155,16 @@ async def retrieve_candidates(
         return []
 
     # ---------- GRAPH EXPANSION ----------
-    # In stateless mode, multi_hop_expand needs a way to check cohort_id.
+    # In stateless mode, multi_hop_expand needs a way to check batch_id.
     # However, since we'll fetch full chunks later, we can temporarily assume the graph 
-    # itself was built per-cohort or check after materialization.
+    # itself was built per-batch or check after materialization.
     # To keep it truly secure, we'll fetch all candidate metadata from Qdrant.
     
     expanded = multi_hop_expand(
         seed_scores=hybrid_scores,
         graph=graph,
         chunk_lookup={}, # We don't have lookup in memory anymore
-        cohort_id=cohort_id,
+        batch_id=batch_id,
         max_hops=2,
         max_total=60,
         use_cache_only=True # Tell traversal to not rely on lookup for filtering if unavailable
@@ -200,9 +200,9 @@ async def retrieve_candidates(
         if not chunk:
             continue
 
-        # CRITICAL SECURITY GATE: Ensure cohort matches
-        chunk_cohort = chunk.get("cohort_id") or chunk.get("metadata", {}).get("cohort_id")
-        if str(chunk_cohort) != str(cohort_id):
+        # CRITICAL SECURITY GATE: Ensure batch matches
+        chunk_batch = chunk.get("batch_id") or chunk.get("metadata", {}).get("batch_id")
+        if str(chunk_batch) != str(batch_id):
             continue
 
         candidates.append({

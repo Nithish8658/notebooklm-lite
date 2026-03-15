@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
-import { fetchFlashcards, fetchQuizzes, fetchPodcasts, switchCohort } from './api';
+import { fetchFlashcards, fetchQuizzes, fetchPodcasts, switchBatch } from './api';
 
 const GlobalStateContext = createContext();
 
@@ -33,35 +33,35 @@ export const GlobalStateProvider = ({ children }) => {
 
   // Initial Load of Persisted Data
   useEffect(() => {
-    if (user && user.user_id && user.active_cohort_id) {
+    if (user && user.username && user.active_batch_id) {
       // Clear old data when context switches to prevent "ghost" data from other courses
       setFlashcards([]);
       setQuizzes([]);
       setPodcasts([]);
 
-      fetchFlashcards(user.user_id, user.active_cohort_id)
+      fetchFlashcards(user.username, user.active_batch_id)
         .then(cards => setFlashcards(cards))
         .catch(err => console.log("No flashcards found or backend offline"));
         
-      fetchQuizzes(user.user_id, user.active_cohort_id)
+      fetchQuizzes(user.username, user.active_batch_id)
         .then(qz => setQuizzes(qz))
         .catch(err => console.log("No quizzes found or backend offline"));
 
-      fetchPodcasts(user.user_id, user.active_cohort_id)
+      fetchPodcasts(user.username, user.active_batch_id)
         .then(pods => setPodcasts(pods))
         .catch(err => console.log("No podcasts found or backend offline"));
     }
-  }, [user, user?.user_id, user?.active_cohort_id]);
+  }, [user, user?.username, user?.active_batch_id]);
 
   const logout = () => {
     setUser(null);
     localStorage.removeItem("notebook_user");
   };
 
-  const handleSwitchCohort = async (newCohortId) => {
+  const handleSwitchBatch = async (newBatchId) => {
     try {
-      const result = await switchCohort(user.user_id, newCohortId);
-      const updatedUser = { ...user, active_cohort_id: result.active_cohort_id };
+      const result = await switchBatch(user.username, newBatchId);
+      const updatedUser = { ...user, active_batch_id: result.active_batch_id };
       setUser(updatedUser);
       localStorage.setItem("notebook_user", JSON.stringify(updatedUser));
     } catch (err) {
@@ -77,7 +77,7 @@ export const GlobalStateProvider = ({ children }) => {
       if (u) localStorage.setItem("notebook_user", JSON.stringify(u));
     },
     logout,
-    switchCohort: handleSwitchCohort,
+    switchBatch: handleSwitchBatch,
     messages,
     setMessages,
     metrics,

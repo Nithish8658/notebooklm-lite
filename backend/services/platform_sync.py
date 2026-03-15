@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 # Database imports for PostgreSQL sync
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from database import AsyncSessionLocal, User, Cohort, UserEnrollment
+from database import AsyncSessionLocal, User, Batch, UserEnrollment
 from sqlalchemy import select, delete
 
 # Load env vars for configuration
@@ -134,7 +134,7 @@ class PlatformSyncService:
             async with AsyncSessionLocal() as db:
                 # No exceptions: only users currently on the platform are kept
                 res = await db.execute(
-                    select(User).where(User.email.not_in(list(seen_usernames)))
+                    select(User).where(User.username.not_in(list(seen_usernames)))
                 )
                 to_delete = res.scalars().all()
                 if to_delete:
@@ -168,7 +168,7 @@ class PlatformSyncService:
             return None
 
     async def _upsert_user_data(self, profile_data, role):
-        """Upserts User, Cohorts, and Enrollments into PostgreSQL."""
+        """Upserts User, Batches, and Enrollments into PostgreSQL."""
         # Note: Platform profile is nested: {"learner": {...}, "enrolledBatches": [...]} 
         # OR for mentor: {"mentor": {...}, "enrolledBatches": [...]}
         
@@ -187,20 +187,20 @@ class PlatformSyncService:
         
         async with AsyncSessionLocal() as db:
             # 1. Upsert User
-            res = await db.execute(select(User).where(User.email == username))
+            res = await db.execute(select(User).where(User.username == username))
             user = res.scalars().first()
             if not user:
                 logger.info(f"Creating new user: {username}")
-                user = User(email=username, role=role)
+                user = User(username=username, role=role)
                 db.add(user)
                 await db.flush()
             else:
                 user.role = role # Update role if changed
             
-            # 2. Sync Cohorts and Enrollments
+            # 2. Sync Batches and Enrollments
             # First, get existing enrollments to avoid duplicates
-            e_res = await db.execute(select(UserEnrollment).where(UserEnrollment.user_id == user.id))
-            existing_cohort_ids = {e.cohort_id for e in e_res.scalars().all()}
+            e_res = await db.execute(select(UserEnrollment).where(UserEnrollment.username == user.username))
+            existing_batch_ids = {e.batch_id for e in e_res.scalars().all()}
             
             # Extract cloud state
             cloud_batch_ids = set()
@@ -209,40 +209,40 @@ class PlatformSyncService:
                 if not b_id: continue
                 cloud_batch_ids.add(b_id)
                 
-                # ENRICHMENT: Use the master name map for the Cohort name, fallback to platform provided names
+                # ENRICHMENT: Use the master name map for the Batch name, fallback to platform provided names
                 b_name = self.batch_name_map.get(b_id) or batch.get("courseName") or batch.get("batchName") or f"Course {b_id}"
                 
-                # Upsert Cohort
-                c_res = await db.execute(select(Cohort).where(Cohort.id == b_id))
-                cohort = c_res.scalars().first()
-                if not cohort:
-                    logger.info(f"Creating new cohort: {b_name} ({b_id})")
-                    db.add(Cohort(id=b_id, name=b_name))
+                # Upsert Batch
+                c_res = await db.execute(select(Batch).where(Batch.id == b_id))
+                batch = c_res.scalars().first()
+                if not batch:
+                    logger.info(f"Creating new batch: {b_name} ({b_id})")
+                    db.add(Batch(id=b_id, name=b_name))
                 else:
                     # Update name if it changed or was previously an ID
-                    if cohort.name != b_name:
-                        logger.info(f"Updating cohort name: {cohort.name} -> {b_name}")
-                        cohort.name = b_name
+                    if batch.name != b_name:
+                        logger.info(f"Updating batch name: {batch.name} -> {b_name}")
+                        batch.name = b_name
                 
                 # Add Enrollment if missing
-                if b_id not in existing_cohort_ids:
+                if b_id not in existing_batch_ids:
                     logger.info(f"Enrolling {username} in {b_id}")
-                    db.add(UserEnrollment(user_id=user.id, cohort_id=b_id))
+                    db.add(UserEnrollment(username=user.username, batch_id=b_id))
             
             # --- PURGE PHASE: Remove stale local enrollments ---
-            stale_enrollments = existing_cohort_ids - cloud_batch_ids
+            stale_enrollments = existing_batch_ids - cloud_batch_ids
             if stale_enrollments:
                 logger.info(f"Purging {len(stale_enrollments)} stale enrollments for {username}")
                 await db.execute(
                     delete(UserEnrollment)
-                    .where(UserEnrollment.user_id == user.id)
-                    .where(UserEnrollment.cohort_id.in_(list(stale_enrollments)))
+                    .where(UserEnrollment.username == user.username)
+                    .where(UserEnrollment.batch_id.in_(list(stale_enrollments)))
                 )
             
             await db.commit()
 
     def get_live_batches(self):
-        """Fetches all cohorts/batches marked as 'live'."""
+        """Fetches all batches/batches marked as 'live'."""
         try:
             url = f"{PLATFORM_BASE_URL}/getbatches"
             response = requests.get(url, headers=self.get_headers(), timeout=15)
@@ -260,17 +260,28 @@ class PlatformSyncService:
     def get_batch_files(self, batch_id):
         """Fetches all files associated with a specific batch ID."""
         try:
+            # Note: External platform API still uses 'cohorts' in the URL path
             url = f"{PLATFORM_BASE_URL}/cohorts/files/{batch_id}"
             response = requests.get(url, headers=self.get_headers(), timeout=15)
             if response.status_code == 401:
                 if self.login(): return self.get_batch_files(batch_id)
                 return []
-            data = response.json()
+            
+            if response.status_code != 200:
+                logger.error(f"Error fetching files for batch {batch_id}: Status {response.status_code}, Body: {response.text[:200]}")
+                return []
+
+            try:
+                data = response.json()
+            except Exception as je:
+                logger.error(f"JSON Parse Error for batch {batch_id}: {je}. Body: {response.text[:200]}")
+                return []
+
             if data.get("status") == "success":
                 return data.get("data", [])
             return []
         except Exception as e:
-            logger.error(f"Error fetching files for batch {batch_id}: {e}")
+            logger.error(f"Request Error fetching files for batch {batch_id}: {e}")
             return []
 
     def get_all_local_ids_for_batch(self, batch_id):
@@ -282,7 +293,7 @@ class PlatformSyncService:
         try:
             payload = {
                 "url": file_url,
-                "cohort_id": batch_id,
+                "batch_id": batch_id,
                 "mode": "single",
                 "filename": file_name,
                 "document_id": file_id
@@ -319,7 +330,7 @@ class PlatformSyncService:
             logger.error("Authentication failed. Skipping cycle.")
             return
 
-        # 0. Build Master Batch Name Map (Friendly names for cohorts)
+        # 0. Build Master Batch Name Map (Friendly names for batches)
         logger.info("Fetching Master Batch metadata...")
         batches = self._fetch_all(GET_BATCHES_URL)
         self.batch_name_map = {
@@ -331,36 +342,36 @@ class PlatformSyncService:
         # 1. Sync Users and Enrollments
         await self.sync_users_and_enrollments()
 
-        # --- GLOBAL COHORT PURGE: Remove batches no longer on the platform ---
+        # --- GLOBAL BATCH PURGE: Remove batches no longer on the platform ---
         valid_batch_ids = set(self.batch_name_map.keys())
         if valid_batch_ids:
             async with AsyncSessionLocal() as db:
-                res = await db.execute(select(Cohort))
-                local_cohorts = res.scalars().all()
-                for cohort in local_cohorts:
-                    if cohort.id not in valid_batch_ids:
-                        logger.info(f"Purging dead cohort: {cohort.name} ({cohort.id})")
+                res = await db.execute(select(Batch))
+                local_batches = res.scalars().all()
+                for batch in local_batches:
+                    if batch.id not in valid_batch_ids:
+                        logger.info(f"Purging dead batch: {batch.name} ({batch.id})")
                         
                         # A. Remove from Qdrant
                         try:
                             from qdrant_client.models import Filter, FieldCondition, MatchValue
                             await qdrant.delete(
                                 collection_name="document_chunks",
-                                points_selector=Filter(must=[FieldCondition(key="cohort_id", match=MatchValue(value=cohort.id))])
+                                points_selector=Filter(must=[FieldCondition(key="batch_id", match=MatchValue(value=batch.id))])
                             )
-                        except Exception as e: logger.error(f"Failed to purge Qdrant for cohort {cohort.id}: {e}")
+                        except Exception as e: logger.error(f"Failed to purge Qdrant for batch {batch.id}: {e}")
 
                         # B. Remove Physical Files
                         import shutil
-                        cohort_dir = os.path.join("backend", "uploads", cohort.id)
-                        if os.path.exists(cohort_dir):
+                        batch_dir = os.path.join("backend", "uploads", batch.id)
+                        if os.path.exists(batch_dir):
                             try:
-                                shutil.rmtree(cohort_dir)
-                                logger.info(f"Deleted files for cohort {cohort.id}")
-                            except Exception as e: logger.error(f"Failed to delete files for {cohort.id}: {e}")
+                                shutil.rmtree(batch_dir)
+                                logger.info(f"Deleted files for batch {batch.id}")
+                            except Exception as e: logger.error(f"Failed to delete files for {batch.id}: {e}")
 
                         # C. Remove from DB
-                        await db.delete(cohort)
+                        await db.delete(batch)
                 await db.commit()
 
         # 2. Sync Files (Existing logic)

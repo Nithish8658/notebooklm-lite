@@ -46,7 +46,7 @@ function TopicSetter() {
 
     try {
       if (mode === 'flashcards') {
-        const newCards = await generateFlashcards(user.user_id, user.active_cohort_id, topics);
+        const newCards = await generateFlashcards(user.username, user.active_batch_id, topics);
         if (newCards.length === 0) {
           setError("No content generated.");
         } else {
@@ -61,7 +61,7 @@ function TopicSetter() {
       } else if (mode === 'quiz') {
         let generatedCount = 0;
         for (const topic of topics) {
-          const quiz = await generateQuiz(user.user_id, user.active_cohort_id, topic);
+          const quiz = await generateQuiz(user.username, user.active_batch_id, topic);
           if (quiz) {
             setQuizzes(prev => [...prev, quiz]);
             generatedCount++;
@@ -78,14 +78,14 @@ function TopicSetter() {
         let generatedCount = 0;
         for (const topic of topics) {
           // generatePodcast now polls until 'completed'
-          await generatePodcast(user.user_id, user.active_cohort_id, topic);
+          await generatePodcast(user.username, user.active_batch_id, topic);
           generatedCount++;
         }
 
         if (generatedCount > 0) {
           // Fetch the full updated list from backend
           const { fetchPodcasts } = await import('../../api'); 
-          const updated = await fetchPodcasts(user.user_id, user.active_cohort_id);
+          const updated = await fetchPodcasts(user.username, user.active_batch_id);
           setPodcasts(updated);
           
           setTopicInput('');
@@ -107,13 +107,13 @@ function TopicSetter() {
     
     try {
       if (mode === 'flashcards') {
-        await deleteFlashcards(user.user_id, user.active_cohort_id, topicName);
+        await deleteFlashcards(user.username, user.active_batch_id, topicName);
         setFlashcards(prev => prev.filter(c => c.topic !== topicName));
       } else if (mode === 'quiz') {
-        await deleteQuiz(user.user_id, user.active_cohort_id, topicName);
+        await deleteQuiz(user.username, user.active_batch_id, topicName);
         setQuizzes(prev => prev.filter(q => q.topic !== topicName));
       } else {
-        await deletePodcast(user.user_id, user.active_cohort_id, topicName);
+        await deletePodcast(user.username, user.active_batch_id, topicName);
         setPodcasts(prev => prev.filter(p => p.topic !== topicName));
       }
     } catch (err) {

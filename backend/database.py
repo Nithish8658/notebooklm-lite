@@ -99,20 +99,19 @@ Base = declarative_base()
 from sqlalchemy import Column, String, DateTime, Text, JSON, ForeignKey
 from sqlalchemy.orm import relationship
 
-# ... (Models User, Cohort, UserEnrollment, Flashcard, Quiz, Podcast unchanged)
+# ... (Models User, Batch, UserEnrollment, Flashcard, Quiz, Podcast defined below)
 
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(String, primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
-    email = Column(String, unique=True, index=True, nullable=False) # Stores Username
+    username = Column(String, primary_key=True, index=True) # Now the primary identifier
     role = Column(String, nullable=True) # learner or mentor
-    last_active_cohort_id = Column(String, nullable=True) # Remembers user's current context
+    last_active_batch_id = Column(String, nullable=True) # Remembers user's current context
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
-class Cohort(Base):
+class Batch(Base):
 # ... (rest of the models remain same until init_db)
-    __tablename__ = "cohorts"
+    __tablename__ = "batches"
     id = Column(String, primary_key=True, index=True) # e.g. "CS101"
     name = Column(String, nullable=False) # e.g. "Computer Science 101"
     graph_data = Column(JSON, nullable=True) # Persisted Knowledge Graph
@@ -123,15 +122,15 @@ class UserEnrollment(Base):
     """Link table for Many-to-Many relationship"""
     __tablename__ = "user_enrollments"
     id = Column(String, primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
-    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    cohort_id = Column(String, ForeignKey("cohorts.id", ondelete="CASCADE"), index=True)
+    username = Column(String, ForeignKey("users.username", ondelete="CASCADE"), index=True)
+    batch_id = Column(String, ForeignKey("batches.id", ondelete="CASCADE"), index=True)
     enrolled_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 class Flashcard(Base):
     __tablename__ = "flashcards"
     id = Column(String, primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
-    user_id = Column(String, index=True, nullable=False)
-    cohort_id = Column(String, index=True, nullable=False)
+    username = Column(String, index=True, nullable=False)
+    batch_id = Column(String, index=True, nullable=False)
     complexity = Column(String, nullable=False, default="Undergrad")
     payload = Column(JSON, nullable=False) # Stores the array of flashcards
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
@@ -139,8 +138,8 @@ class Flashcard(Base):
 class Quiz(Base):
     __tablename__ = "quizzes"
     id = Column(String, primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
-    user_id = Column(String, index=True, nullable=False)
-    cohort_id = Column(String, index=True, nullable=False)
+    username = Column(String, index=True, nullable=False)
+    batch_id = Column(String, index=True, nullable=False)
     complexity = Column(String, nullable=False, default="Undergrad")
     payload = Column(JSON, nullable=False) # Stores the quiz questions
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
@@ -148,8 +147,8 @@ class Quiz(Base):
 class Podcast(Base):
     __tablename__ = "podcasts"
     id = Column(String, primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
-    user_id = Column(String, index=True, nullable=False)
-    cohort_id = Column(String, index=True, nullable=False)
+    username = Column(String, index=True, nullable=False)
+    batch_id = Column(String, index=True, nullable=False)
     complexity = Column(String, nullable=False, default="Undergrad")
     topic = Column(String, nullable=True)
     filename = Column(String, nullable=False)
@@ -175,11 +174,11 @@ def init_db():
     print("DB: Ensuring all tables exist...")
     Base.metadata.create_all(bind=sync_engine)
     
-    # Manual Migration for existing 'cohorts' table if it was created before stateless refactor
+    # Manual Migration for existing 'batches' table if it was created before stateless refactor
     with sync_engine.connect() as conn:
         try:
-            conn.execute(text("ALTER TABLE cohorts ADD COLUMN IF NOT EXISTS graph_data JSON;"))
-            conn.execute(text("ALTER TABLE cohorts ADD COLUMN IF NOT EXISTS bm25_data JSON;"))
+            conn.execute(text("ALTER TABLE batches ADD COLUMN IF NOT EXISTS graph_data JSON;"))
+            conn.execute(text("ALTER TABLE batches ADD COLUMN IF NOT EXISTS bm25_data JSON;"))
             conn.execute(text("ALTER TABLE podcasts ADD COLUMN IF NOT EXISTS topic VARCHAR;"))
             
             # Add complexity column to Studio tables

@@ -12,7 +12,7 @@ MODEL_MAP = {
         "allow_patterns": ["*.json", "*.txt", "onnx/model.onnx"] 
     },
     "reranker-onnx": {
-        "repo_id": "Xenova/ms-marco-MiniLM-L-6-v2",
+        "repo_id": "Xenova/ms-marco-MiniLM-L-4-v2",
         # Only download the quantized version (3x faster) and configs
         "allow_patterns": ["*.json", "*.txt", "onnx/model_quantized.onnx"]
     }

@@ -5,15 +5,15 @@ import { useGlobalState } from "../GlobalState";
 function YoutubeIngest() {
   const { user, youtubeStatus: status, setYoutubeStatus: setStatus } = useGlobalState();
   const [url, setUrl] = useState("");
-  const [cohortId, setCohortId] = useState(user?.active_cohort_id || "default_cohort");
+  const [batchId, setBatchId] = useState(user?.active_batch_id || "default_batch");
   const [loading, setLoading] = useState(false);
 
-  // Sync cohortId if active context changes
+  // Sync batchId if active context changes
   useEffect(() => {
-    if (user?.active_cohort_id) {
-      setCohortId(user.active_cohort_id);
+    if (user?.active_batch_id) {
+      setBatchId(user.active_batch_id);
     }
-  }, [user?.active_cohort_id]);
+  }, [user?.active_batch_id]);
 
   const handleIngest = async () => {
     if (!url) {
@@ -30,7 +30,7 @@ function YoutubeIngest() {
     try {
       setLoading(true);
       setStatus("Processing YouTube video (this may take a minute)...");
-      const result = await ingestYoutube(url, cohortId);
+      const result = await ingestYoutube(url, batchId);
       setStatus(`Success: Video indexed! (ID: ${result.document_id})`);
       setUrl("");
     } catch (err) {
@@ -45,12 +45,12 @@ function YoutubeIngest() {
       <h3>Add YouTube Video</h3>
 
       <div style={{ marginBottom: '10px' }}>
-        <label style={{ fontSize: '0.8rem', color: '#666', display: 'block', marginBottom: '4px' }}>Target Cohort ID</label>
+        <label style={{ fontSize: '0.8rem', color: '#666', display: 'block', marginBottom: '4px' }}>Target Batch ID</label>
         <input 
           type="text" 
-          value={cohortId} 
-          onChange={(e) => setCohortId(e.target.value)}
-          placeholder="Cohort ID"
+          value={batchId} 
+          onChange={(e) => setBatchId(e.target.value)}
+          placeholder="Batch ID"
           style={{ 
             width: '100%', 
             padding: '6px', 
