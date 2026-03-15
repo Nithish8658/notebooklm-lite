@@ -7,16 +7,19 @@ import math
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 import json
+import sys
+import time
+from pathlib import Path
+
+# Add backend to sys.path if not present for torchaudio_patch
+backend_dir = str(Path(__file__).parent.parent)
+if backend_dir not in sys.path:
+    sys.path.append(backend_dir)
+
 try:
     import torchaudio_patch
 except ImportError:
-    import sys
-    from pathlib import Path
-    sys.path.append(str(Path(__file__).parent.parent))
-    try:
-        import torchaudio_patch
-    except ImportError:
-        pass
+    print("Warning: torchaudio_patch not found.")
 
 # Initialize optional dependencies to None
 yt_dlp = None
@@ -35,8 +38,8 @@ try:
     import torch
     import gc
     import pandas as pd
-except ImportError:
-    pass
+except ImportError as e:
+    print(f"DEBUG: Failed to import whisperx: {e}")
 
 # ==============================================================================
 # CONFIGURATION
@@ -237,14 +240,25 @@ def transcribe_with_whisperx(audio_path: Path, model=None) -> Dict[str, Any]:
 
     try:
         # 1. Transcribe (ASR)
+        t_start_p2 = time.time()
         should_cleanup = False
         if model is None:
+            logger.info("[PHASE 2.1] Loading WhisperX Model...")
+            t_model_load = time.time()
             model = load_whisperx_model()
             should_cleanup = True
+            logger.info(f"[PHASE 2.1] Model Load Time: {time.time() - t_model_load:.2f}s")
         
-        logger.info("Transcribing audio...")
+        logger.info("[PHASE 2.2] Loading Audio into Memory...")
+        t_audio_load = time.time()
         audio = whisperx.load_audio(audio_file)
+        logger.info(f"[PHASE 2.2] Audio Load Time: {time.time() - t_audio_load:.2f}s")
+
+        logger.info("[PHASE 2.3] Starting ASR (Transcription)...")
+        # Reverted: Now allowing automatic language detection
+        t_asr = time.time()
         result = model.transcribe(audio, batch_size=BATCH_SIZE)
+        logger.info(f"[PHASE 2.3] ASR Execution Time: {time.time() - t_asr:.2f}s")
         
         # Cleanup ASR model ONLY if we loaded it locally
         if should_cleanup:
@@ -254,22 +268,22 @@ def transcribe_with_whisperx(audio_path: Path, model=None) -> Dict[str, Any]:
                 torch.cuda.empty_cache()
 
         # 2. Alignment (Forced Alignment)
-        # This provides precise word timestamps required for our segmentation logic
-        logger.info(f"Aligning transcript for language: {result['language']}...")
+        logger.info(f"[PHASE 2.4] Aligning transcript for language: {result['language']}...")
         
-        # AC-31: Local-Only Alignment Guard
-        # Specify a fixed download_root so it doesn't pollute different folders
-        # and we can easily check/pre-load these in the future.
         project_root = Path(__file__).parent.parent
         align_model_dir = project_root / "models" / "alignment"
         align_model_dir.mkdir(parents=True, exist_ok=True)
         
+        t_align_load = time.time()
         model_a, metadata = whisperx.load_align_model(
             language_code=result["language"], 
             device=DEVICE,
             model_dir=str(align_model_dir)
         )
-        logger.info("Alignment model loaded. Starting alignment...")
+        logger.info(f"[PHASE 2.4] Alignment Model Load Time: {time.time() - t_align_load:.2f}s")
+
+        logger.info("[PHASE 2.5] Starting Alignment...")
+        t_align_exec = time.time()
         result = whisperx.align(
             result["segments"], 
             model_a, 
@@ -278,7 +292,7 @@ def transcribe_with_whisperx(audio_path: Path, model=None) -> Dict[str, Any]:
             DEVICE, 
             return_char_alignments=False
         )
-        logger.info("Alignment completed.")
+        logger.info(f"[PHASE 2.5] Alignment Execution Time: {time.time() - t_align_exec:.2f}s")
         
         # Cleanup Alignment model
         del model_a
@@ -286,36 +300,15 @@ def transcribe_with_whisperx(audio_path: Path, model=None) -> Dict[str, Any]:
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
 
-        # 3. Diarization (Speaker Identification)
-        hf_token = _get_hf_token()
-        if not hf_token:
-            logger.info("HF_TOKEN not found. Skipping diarization (all text will be SPEAKER_00).")
-            # Assign default speaker to all segments to allow downstream logic to work
-            for seg in result["segments"]:
-                seg["speaker"] = "SPEAKER_00"
-                if "words" in seg:
-                    for word in seg["words"]:
-                        word["speaker"] = "SPEAKER_00"
-        else:
-            logger.info("Diarizing audio (Pyannote)...")
-            try:
-                diarize_model = whisperx.DiarizationPipeline(
-                    use_auth_token=hf_token, 
-                    device=DEVICE
-                )
-                logger.info("Diarization pipeline initialized. Starting diarization...")
-                diarize_segments = diarize_model(audio)
-                logger.info("Diarization segments obtained. Assigning speakers to words...")
-                
-                # Assign speakers to the aligned words
-                result = whisperx.assign_word_speakers(diarize_segments, result)
-                logger.info("Speaker assignment completed.")
-            except Exception as e:
-                logger.error(f"Diarization failed: {e}. Proceeding without speaker labels.")
-                # Fallback for errors
-                for seg in result["segments"]:
-                    seg["speaker"] = "SPEAKER_UNKNOWN"
+        # 3. Diarization (SKIP - Performance Optimization)
+        logger.info("[PHASE 2.6] INDUSTRIAL OPTIMIZATION: Skipping Diarization.")
+        for seg in result["segments"]:
+            seg["speaker"] = "SPEAKER_00"
+            if "words" in seg:
+                for word in seg["words"]:
+                    word["speaker"] = "SPEAKER_00"
         
+        logger.info(f"Phase 2 Total Time: {time.time() - t_start_p2:.2f}s")
         return result
     finally:
         # Restore PATH

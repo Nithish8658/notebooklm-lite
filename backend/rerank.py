@@ -6,10 +6,25 @@ from pathlib import Path
 from collections import OrderedDict
 import multiprocessing
 
+# AC-100: Critical DLL Path Injection for OpenVINO on Windows
+if sys.platform == "win32":
+    try:
+        import openvino
+        ov_libs = Path(openvino.__file__).parent / "libs"
+        if ov_libs.exists():
+            os.add_dll_directory(str(ov_libs.absolute()))
+    except Exception:
+        pass
+
 import torch
 from transformers import AutoTokenizer
 import onnxruntime as ort
 from optimum.onnxruntime import ORTModelForSequenceClassification
+try:
+    from optimum.intel.openvino import OVModelForSequenceClassification
+    _HAS_OV = True
+except ImportError:
+    _HAS_OV = False
 
 _LOG = logging.getLogger("rerank")
 _RERANKER_MODEL = None
@@ -53,12 +68,12 @@ class OnnxCrossEncoder:
                  model_filename, subfolder or "root", onnx_dir)
         
         # 1. Thread Management: Hardware-Aware and Scale-Safe
-        # ... rest of __init__ logic ...
         env_threads = os.getenv("RERANKER_THREADS")
         if env_threads:
             num_threads = int(env_threads)
         else:
             total_cores = multiprocessing.cpu_count()
+            # Optimization: 4 threads is often the sweet spot for MiniLM on consumer CPUs
             num_threads = min(4, max(1, total_cores // 2))
             
         _LOG.info("CPU Optimization: Using %d threads for reranking inference.", num_threads)
@@ -74,13 +89,12 @@ class OnnxCrossEncoder:
 
         if "OpenVINOExecutionProvider" in available_providers:
             provider = "OpenVINOExecutionProvider"
-            # Optimization: Remove explicit precision to let OpenVINO auto-negotiate 
-            # the best mode for the current CPU while keeping low-latency streams.
+            # Optimization: num_streams=1 reduces latency for single-user queries
             provider_options = {
                 "device_type": "CPU",
                 "num_streams": "1"
             }
-            _LOG.info("OpenVINO detected. Enabling high-speed Intel inference.")
+            _LOG.info("OpenVINO detected. Enabling high-speed Intel inference (Latency Mode).")
         
         # Use .as_posix() for Windows path compatibility
         self.tokenizer = AutoTokenizer.from_pretrained(onnx_dir.as_posix(), local_files_only=True)

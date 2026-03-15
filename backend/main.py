@@ -161,11 +161,16 @@ async def lifespan(app: FastAPI):
 
     print("\n--- MASTER STARTUP: Verifying & Loading Models ---")
     try:
+        # Suppress noisy OpenVINO/Torch warnings for cleaner startup
+        import logging as py_logging
+        py_logging.getLogger("optimum.intel.openvino").setLevel(py_logging.ERROR)
+        os.environ["TORCH_LOGS"] = "-ERROR"
+
         from services.bootstrap import verify_all_models
         from services.embeddings import load_embedding_model, get_embedding_model
         from rerank import load_reranker, get_reranker
         
-        # 1. Master Download (Only main process handles this)
+        # 1. Master Download
         print("STARTUP: Verifying all required models on disk...")
         await asyncio.to_thread(verify_all_models)
         
@@ -175,14 +180,23 @@ async def lifespan(app: FastAPI):
         load_whisper_model()
         load_reranker()
         
-        # 3. Warm-up Inference
-        print("STARTUP: Running model sanity checks (Warm-up)...")
-        emb_model = get_embedding_model()
-        _ = emb_model.encode(["Sanity check for BGE Embedding"])
-        
-        reranker = get_reranker()
-        _ = reranker.predict([("test query", "test document context")])
-        print("STARTUP: All models verified and warmed up correctly.")
+        # 3. Deferred Warm-up (Non-blocking)
+        import threading
+        def run_warmup():
+            try:
+                t_w_start = time.time()
+                print("STARTUP: Running model sanity checks (Warm-up) in background...")
+                emb_model = get_embedding_model()
+                _ = emb_model.encode(["Sanity check for BGE Embedding"])
+                
+                reranker = get_reranker()
+                # Verify adaptive logic with a small batch
+                _ = reranker.predict([("test query", "test context")] * 2)
+                print(f"STARTUP: All models warmed up successfully in {time.time() - t_w_start:.2f}s.")
+            except Exception as e_warm:
+                print(f"WARNING: Background warm-up failed: {e_warm}")
+
+        threading.Thread(target=run_warmup, daemon=True).start()
         
         # --- AUTO-SYNC STARTUP ---
         # 1. Run one-time sync cycle for Users and Enrollments ONLY (Database only)
