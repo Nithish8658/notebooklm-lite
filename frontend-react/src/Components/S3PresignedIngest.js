@@ -5,16 +5,16 @@ import { useGlobalState } from "../GlobalState";
 function S3PresignedIngest() {
   const { user, setWebStatus: setStatus } = useGlobalState();
   const [urlsText, setUrlsText] = useState("");
-  const [cohortId, setCohortId] = useState(user?.active_cohort_id || "default_cohort");
+  const [batchId, setBatchId] = useState(user?.active_batch_id || "default_batch");
   const [loading, setLoading] = useState(false);
   const [localStatus, setLocalStatus] = useState("");
 
-  // Sync cohortId if active context changes
+  // Sync batchId if active context changes
   useEffect(() => {
-    if (user?.active_cohort_id) {
-      setCohortId(user.active_cohort_id);
+    if (user?.active_batch_id) {
+      setBatchId(user.active_batch_id);
     }
-  }, [user?.active_cohort_id]);
+  }, [user?.active_batch_id]);
 
   const handleIngest = async () => {
     const urls = urlsText
@@ -31,7 +31,7 @@ function S3PresignedIngest() {
       setLoading(true);
       setLocalStatus(`Starting batch ingestion for ${urls.length} files...`);
       
-      await ingestBatchUrls(urls, cohortId);
+      await ingestBatchUrls(urls, batchId);
       
       setLocalStatus(`Success: ${urls.length} S3 sources indexed!`);
       setStatus(`Success: ${urls.length} S3 sources indexed!`);
@@ -49,12 +49,12 @@ function S3PresignedIngest() {
       <h3>Add S3 Presigned URLs (Batch)</h3>
 
       <div style={{ marginBottom: '10px' }}>
-        <label style={{ fontSize: '0.8rem', color: '#666', display: 'block', marginBottom: '4px' }}>Target Cohort ID</label>
+        <label style={{ fontSize: '0.8rem', color: '#666', display: 'block', marginBottom: '4px' }}>Target Batch ID</label>
         <input 
           type="text" 
-          value={cohortId} 
-          onChange={(e) => setCohortId(e.target.value)}
-          placeholder="Cohort ID"
+          value={batchId} 
+          onChange={(e) => setBatchId(e.target.value)}
+          placeholder="Batch ID"
           style={{ 
             width: '100%', 
             padding: '6px', 

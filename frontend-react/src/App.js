@@ -13,7 +13,7 @@ import SourceManagement from "./pages/SourceManagement";
 import Metrics from "./pages/Metrics";
 
 function App() {
-  const { user, logout, switchCohort } = useGlobalState();
+  const { user, logout, switchBatch } = useGlobalState();
 
   if (!user) {
     return <Auth />;
@@ -33,8 +33,8 @@ function App() {
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', background: '#f0f4ff', padding: '4px 12px', borderRadius: '20px', border: '1px solid #d0dfff' }}>
           <span style={{ fontSize: '0.75rem', fontWeight: 'bold', color: '#555' }}>COURSE:</span>
           <select 
-            value={user.active_cohort_id} 
-            onChange={(e) => switchCohort(e.target.value)}
+            value={user.active_batch_id} 
+            onChange={(e) => switchBatch(e.target.value)}
             style={{ 
               background: 'transparent', 
               border: 'none', 
@@ -44,7 +44,7 @@ function App() {
               cursor: 'pointer'
             }}
           >
-            {user.enrolled_cohorts?.map(c => (
+            {user.enrolled_batches?.map(c => (
               <option key={c.id} value={c.id}>{c.name}</option>
             ))}
           </select>

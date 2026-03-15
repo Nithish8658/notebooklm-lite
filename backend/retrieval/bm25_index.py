@@ -56,7 +56,7 @@ class BM25ChunkIndex:
 
     def __init__(self, chunks: List[Dict]):
         self.chunk_ids: List[str] = []
-        self.cohort_ids: List[str] = [] # Track cohort for filtering
+        self.batch_ids: List[str] = [] # Track batch for filtering
         self.bm25: Optional[BM25Okapi] = None
         
         if not chunks:
@@ -66,7 +66,7 @@ class BM25ChunkIndex:
         def get_corpus():
             for c in chunks:
                 cid = c.get("chunk_id")
-                cohort = c.get("cohort_id") or c.get("metadata", {}).get("cohort_id", "default_cohort")
+                batch = c.get("batch_id") or c.get("metadata", {}).get("batch_id", "default_batch")
                 if not cid:
                     continue # Skip chunks with missing IDs
                 
@@ -74,7 +74,7 @@ class BM25ChunkIndex:
                 tokens = tokenize(text)
                 if tokens:
                     self.chunk_ids.append(str(cid))
-                    self.cohort_ids.append(str(cohort))
+                    self.batch_ids.append(str(batch))
                     yield tokens
 
         print(f"[BM25] Building index with {len(chunks)} chunks...")
@@ -97,7 +97,7 @@ class BM25ChunkIndex:
             return {}
         return {
             "chunk_ids": self.chunk_ids,
-            "cohort_ids": self.cohort_ids,
+            "batch_ids": self.batch_ids,
             "doc_freqs": self.bm25.doc_freqs,
             "idf": self.bm25.idf,
             "doc_len": self.bm25.doc_len,
@@ -116,7 +116,7 @@ class BM25ChunkIndex:
         
         instance = cls([]) # Create empty instance
         instance.chunk_ids = data["chunk_ids"]
-        instance.cohort_ids = data["cohort_ids"]
+        instance.batch_ids = data["batch_ids"]
         
         # Reconstruct BM25Okapi state WITHOUT calling the standard constructor 
         # to avoid the ZeroDivisionError on initialization logic.
@@ -135,9 +135,9 @@ class BM25ChunkIndex:
         instance.bm25 = bm25_obj
         return instance
 
-    def search(self, query: str, cohort_id: str = None, top_k: int = 20) -> Dict[str, float]:
+    def search(self, query: str, batch_id: str = None, top_k: int = 20) -> Dict[str, float]:
         """
-        Sparse retrieval using BM25 with cohort isolation.
+        Sparse retrieval using BM25 with batch isolation.
         """
         if not self.bm25:
             return {}
@@ -148,13 +148,13 @@ class BM25ChunkIndex:
 
         scores = self.bm25.get_scores(tokens)
         
-        # Zip IDs, Cohorts and Scores for filtering
-        all_results = list(zip(self.chunk_ids, self.cohort_ids, scores))
+        # Zip IDs, Batches and Scores for filtering
+        all_results = list(zip(self.chunk_ids, self.batch_ids, scores))
         
-        if cohort_id:
+        if batch_id:
             filtered_results = [
                 (cid, score) for cid, chid, score in all_results
-                if chid == cohort_id
+                if chid == batch_id
             ]
         else:
             filtered_results = [(cid, score) for cid, chid, score in all_results]

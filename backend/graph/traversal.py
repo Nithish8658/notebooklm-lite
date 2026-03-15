@@ -21,7 +21,7 @@ def multi_hop_expand(
     seed_scores: Dict[str, float],
     graph: Dict[str, Dict[str, List[str]]],
     chunk_lookup: Dict[str, dict], 
-    cohort_id: str,               
+    batch_id: str,               
     *,
     max_hops: int = 3,
     max_total: int = 40,
@@ -30,7 +30,7 @@ def multi_hop_expand(
 ) -> Dict[str, float]:
     """
     Upgraded Multi-Hop Expansion with Path Resonance and Priority Flow.
-    Now with strict Cohort Firewall to reduce reranker load.
+    Now with strict Batch Firewall to reduce reranker load.
     """
 
     if not seed_scores:
@@ -66,14 +66,14 @@ def multi_hop_expand(
                 incoming_score = base_score * weight * DEFAULT_HOP_DECAY
                 
                 for nbr in target_nodes:
-                    # COHORT FIREWALL: Verify neighbor belongs to same cohort before adding
+                    # BATCH FIREWALL: Verify neighbor belongs to same batch before adding
                     if not use_cache_only:
                         nbr_chunk = chunk_lookup.get(nbr)
                         if not nbr_chunk:
                             continue
                         
-                        nbr_cohort = nbr_chunk.get("cohort_id") or nbr_chunk.get("metadata", {}).get("cohort_id")
-                        if str(nbr_cohort) != str(cohort_id):
+                        nbr_batch = nbr_chunk.get("batch_id") or nbr_chunk.get("metadata", {}).get("batch_id")
+                        if str(nbr_batch) != str(batch_id):
                             continue
 
                     # Path Resonance
