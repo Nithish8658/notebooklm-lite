@@ -46,7 +46,7 @@ from services.flashcards import generate_flashcards
 from services.quiz import generate_quiz_for_topic
 from services.podcast import generate_podcast, PodcastRefusalError
 
-from database import init_db, get_db, User, Flashcard, Quiz, Podcast, Batch, UserEnrollment, IngestionJob, AsyncSessionLocal, engine
+from database import init_db, get_db, User, Flashcard, Quiz, Podcast, Batch, UserEnrollment, IngestionJob, AsyncSessionLocal
 from services.index_state import index_manager
 from services.embeddings import BatchEmbeddingManager, get_embedding_model, load_embedding_model
 from services.concurrency import BatchRerankManager, db_semaphore
@@ -74,6 +74,8 @@ if not GEMINI_API_KEY:
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 REDIS_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
 
+from infrastructure import init_infra, close_infra, redis_client, qdrant
+
 # --- COOLDOWN HELPERS ---
 async def set_cooldown(batch_id: str, topic: str, cache_type: str, duration: int = 180):
     """Sets a 3-minute (180s) cooldown for a specific topic, type, and BATCH."""
@@ -98,51 +100,6 @@ async def check_cooldown(batch_id: str, topic: str, cache_type: str):
         print(f"DEBUG: Cooldown check error (ignoring): {e}")
 
 # ===== CACHE & DB =====
-class RedisProxy:
-    def __init__(self, url):
-        self._url = url
-        self._client = None
-        self._loop = None
-
-    def _get_client(self):
-        try:
-            loop = asyncio.get_running_loop()
-            if self._client is None or self._loop != loop or loop.is_closed():
-                self._client = redis.from_url(self._url, decode_responses=True)
-                self._loop = loop
-            return self._client
-        except RuntimeError:
-            # Fallback for sync or non-loop contexts
-            if self._client is None:
-                self._client = redis.from_url(self._url, decode_responses=True)
-            return self._client
-
-    def __getattr__(self, name):
-        return getattr(self._get_client(), name)
-
-class QdrantProxy:
-    def __init__(self, url):
-        self._url = url
-        self._client = None
-        self._loop = None
-
-    def _get_client(self):
-        try:
-            loop = asyncio.get_running_loop()
-            if self._client is None or self._loop != loop or loop.is_closed():
-                self._client = AsyncQdrantClient(url=self._url)
-                self._loop = loop
-            return self._client
-        except RuntimeError:
-            if self._client is None:
-                self._client = AsyncQdrantClient(url=self._url)
-            return self._client
-
-    def __getattr__(self, name):
-        return getattr(self._get_client(), name)
-
-redis_client = RedisProxy(REDIS_URL)
-qdrant = QdrantProxy(QDRANT_URL)
 QDRANT_COLLECTION = "document_chunks"
 CACHE_COLLECTION = "semantic_cache"
 
@@ -171,6 +128,9 @@ async def initialize_qdrant():
 # ===== LIFESPAN =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Initialize Process-Scoped Infrastructure
+    await init_infra()
+    
     print("--- HW ACCELERATION DIAGNOSTICS ---")
     try:
         import torch
@@ -237,7 +197,13 @@ async def lifespan(app: FastAPI):
         def run_continuous_poller():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            loop.run_until_complete(sync_service.start())
+            async def poller_lifecycle():
+                await init_infra()
+                try:
+                    await sync_service.start()
+                finally:
+                    await close_infra()
+            loop.run_until_complete(poller_lifecycle())
 
         poller_thread = threading.Thread(target=run_continuous_poller, daemon=True)
         poller_thread.start()
@@ -245,7 +211,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f" CRITICAL ERROR during model loading: {e}")
         traceback.print_exc()
+    
     yield
+    # Upgrade 2: Explicit Cleanup
+    print("SHUTDOWN: Releasing all infrastructure connections...")
+    await close_infra()
 
 # ===== CACHE HELPERS =====
 async def get_semantic_cache(batch_id: str, topic: str, cache_type: str, filters: Optional[Dict[str, Any]] = None):
@@ -701,8 +671,7 @@ async def generate_podcast_background(job_id: str, username: str, batch_id: str,
                 job.message = str(e)
                 await db.commit()
     finally:
-        from database import _db_proxy
-        await _db_proxy.get_engine().dispose()
+        await close_infra()
 
 # ===== DELETE STUDIO TOOLS =====
 @app.delete("/studio/flashcards")
@@ -1256,8 +1225,7 @@ async def process_ingestion_background(job_id: str, input_path: str, file_type: 
                 await db.commit()
     finally:
         if mode == "single":
-            from database import _db_proxy
-            await _db_proxy.get_engine().dispose()
+            await close_infra()
 
 async def process_batch_ingestion_background(job_id: str, urls: List[str], batch_id: str):
     try:
@@ -1280,8 +1248,7 @@ async def process_batch_ingestion_background(job_id: str, urls: List[str], batch
                 job.message = f"Batch failed: {str(e)}"
                 await db.commit()
     finally:
-        from database import _db_proxy
-        await _db_proxy.get_engine().dispose()
+        await close_infra()
 
 @app.get("/jobs/{job_id}", response_model=JobResponse)
 async def get_job_status(job_id: str, db: AsyncSession = Depends(get_db)):

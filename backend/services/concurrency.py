@@ -75,5 +75,18 @@ class BatchRerankManager:
                 for _ in range(len(batch)): 
                     self.queue.task_done()
 
-# Connection Guard for PostgreSQL
-db_semaphore = asyncio.Semaphore(80) # Industrial limit to prevent DB crash
+from infrastructure import get_infra
+
+class SemaphoreProxy:
+    """
+    Acts as a proxy for the db_semaphore.
+    Delegates to the infrastructure container assigned to the current event loop.
+    """
+    async def __aenter__(self):
+        return await get_infra().db_semaphore.__aenter__()
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return await get_infra().db_semaphore.__aexit__(exc_type, exc_val, exc_tb)
+
+# Connection Guard for PostgreSQL (Dynamic Proxy)
+db_semaphore = SemaphoreProxy()

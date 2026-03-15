@@ -1,98 +1,26 @@
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import declarative_base
 import uuid
 import datetime
-
 import os
-
-import asyncio
-import weakref
+from infrastructure import get_infra
 
 # Database URL for PostgreSQL in Docker
-# Using postgresql+asyncpg for async support
 SQLALCHEMY_DATABASE_URL = os.getenv(
     "DATABASE_URL", 
     "postgresql+asyncpg://notebook:notebook@localhost:5432/notebooklm"
 )
 
-class AsyncDatabaseProxy:
-    def __init__(self, url):
-        self._url = url
-        # Use WeakKeyDictionary to allow loops to be GC'd
-        self._engines = weakref.WeakKeyDictionary()
-        self._sessionmakers = weakref.WeakKeyDictionary()
-        # Fallback for when there's no running loop (e.g. during import)
-        self._fallback_engine = None
-        self._fallback_sessionmaker = None
-
-    def get_engine(self):
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            if self._fallback_engine is None:
-                self._fallback_engine = create_async_engine(
-                    self._url,
-                    pool_pre_ping=True,
-                    pool_size=20,
-                    max_overflow=10,
-                    pool_recycle=3600,
-                )
-            return self._fallback_engine
-        
-        if loop not in self._engines:
-            self._engines[loop] = create_async_engine(
-                self._url,
-                pool_pre_ping=True,
-                pool_size=200,       # AC-23: Increased from 100 for massive concurrency
-                max_overflow=100,    # AC-23: Increased from 50
-                pool_recycle=3600,
-            )
-        return self._engines[loop]
-
-    def get_sessionmaker(self):
-        try:
-            loop = asyncio.get_running_loop()
-            engine = self.get_engine()
-            if loop not in self._sessionmakers:
-                self._sessionmakers[loop] = async_sessionmaker(
-                    bind=engine, 
-                    class_=AsyncSession, 
-                    expire_on_commit=False,
-                    autocommit=False,
-                    autoflush=False
-                )
-            return self._sessionmakers[loop]
-        except RuntimeError:
-            if self._fallback_sessionmaker is None:
-                engine = self.get_engine()
-                self._fallback_sessionmaker = async_sessionmaker(
-                    bind=engine, 
-                    class_=AsyncSession, 
-                    expire_on_commit=False,
-                    autocommit=False,
-                    autoflush=False
-                )
-            return self._fallback_sessionmaker
-
+# --- SOPHISTICATED DYNAMIC SESSION ACCESS ---
+class AsyncSessionLocalProxy:
+    """
+    Acts as a proxy for the AsyncSessionLocal sessionmaker.
+    Delegates to the infrastructure container assigned to the current event loop.
+    """
     def __call__(self, **kwargs):
-        """Allows using AsyncSessionLocal() as before."""
-        return self.get_sessionmaker()(**kwargs)
+        return get_infra().db_sessionmaker(**kwargs)
 
-    def dispose_current(self):
-        """Optional: call this to cleanup the engine for the current loop."""
-        try:
-            loop = asyncio.get_running_loop()
-            if loop in self._engines:
-                # We can't easily await here if called from sync finally,
-                # but we can remove it from our cache at least.
-                # The caller should ideally call await proxy.get_engine().dispose()
-                pass
-        except RuntimeError:
-            pass
-
-_db_proxy = AsyncDatabaseProxy(SQLALCHEMY_DATABASE_URL)
-engine = _db_proxy.get_engine() # For backward compatibility where used directly
-AsyncSessionLocal = _db_proxy
+AsyncSessionLocal = AsyncSessionLocalProxy()
 
 Base = declarative_base()
 

@@ -13,6 +13,7 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from database import AsyncSessionLocal, User, Batch, UserEnrollment
 from sqlalchemy import select, delete
+from infrastructure import qdrant
 
 # Load env vars for configuration
 load_dotenv()
