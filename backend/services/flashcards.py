@@ -34,9 +34,10 @@ async def generate_flashcards(
 ) -> List[dict]:
     """
     Generates retrieval-grounded flashcards (Async/Stateless).
+    Uses Concurrent Fan-Out for multi-topic requests.
     """
     llm_fn = call_gemini_fn or call_gemini_async
-    
+
     complexity_map = {
         "5-Year-Old": "Use very simple words and basic concepts only.",
         "High School": "Use clear, standard language suitable for teens.",
@@ -45,15 +46,21 @@ async def generate_flashcards(
     }
     c_instr = complexity_map.get(complexity, complexity_map["Undergrad"])
 
-    all_final_cards = []
+    if not topics or not dense_retrieve_fn:
+        return []
 
-    if topics and dense_retrieve_fn:
-        for topic in topics:
-            print(f"   [Flashcards] Generating up to {limit} cards for topic: '{topic}' at {complexity} level...")
-            
+    # AC-52: Internal Semaphore to prevent LLM rate-limiting during fan-out
+    # Limits parallel LLM calls to 3 topics at once.
+    sem = asyncio.Semaphore(3)
+
+    async def generate_for_topic(topic: str) -> List[dict]:
+        async with sem:
+            print(f"   [Flashcards] Generating cards for topic: '{topic}'...")
+
+            # Retrieval Pipeline
             rewrite_result = await rewrite_query_ensemble(topic, llm_fn, 3, 2, use_llm=True)
             rewrites = rewrite_result.get("rewrites", [{"query": topic, "weight": 1.0}])
-            
+
             candidates = await retrieve_candidates(
                 query=topic,
                 rewrites=rewrites,
@@ -63,13 +70,12 @@ async def generate_flashcards(
                 dense_fn=dense_retrieve_fn,
                 batch_id=batch_id,
                 max_candidates=15,
-                min_dense_score=0.30 # AC-35: Enforce Chat-level precision
+                min_dense_score=0.30 
             )
 
-            
             if not candidates:
-                print(f"   [Flashcards] No context found for topic: '{topic}'. Skipping.")
-                continue
+                print(f"   [Flashcards] No context found for topic: '{topic}'.")
+                return []
 
             context_text = " ".join([
                 f"<CHUNK id='{c.get('doc_id') or c.get('chunk_id')}'>\n{c['text']}\n</CHUNK>"
@@ -81,7 +87,6 @@ async def generate_flashcards(
             Your Goal: Create a set of high-quality Flashcards for the specific topic: "{topic}".
             
             COMPLEXITY LEVEL: {complexity} ({c_instr})
-
             STRICT CONSTRAINTS:
             1. TOPIC-FOCUS: All cards must strictly relate to "{topic}".
             2. EVIDENCE-LOCKED: Every answer MUST be derived *exclusively* from the provided CHUNK sources.
@@ -110,24 +115,34 @@ async def generate_flashcards(
             
             Generate {limit} flashcards for "{topic}" now.
             """
-
             try:
                 response_text = await llm_fn(prompt)
                 data = safe_json_load(response_text)
-                flashcard_set = FlashcardSet(**data)
                 
+                # Robustness: Handle both list and object responses
+                if isinstance(data, list):
+                    data = {"cards": data}
+                elif not isinstance(data, dict):
+                    raise ValueError(f"Unexpected JSON format from LLM: {type(data)}")
+
+                flashcard_set = FlashcardSet(**data)
+
                 valid_cards = [
                     card.dict() for card in flashcard_set.cards 
                     if card.confidence_score >= 0.7
                 ]
-                
                 for vc in valid_cards:
                     vc["topic"] = topic
-                    
-                all_final_cards.extend(valid_cards)
-                print(f"   [Flashcards] Successfully generated {len(valid_cards)} cards for '{topic}'.")
+                return valid_cards
             except Exception as e:
-                print(f"   [Flashcards] Failed for topic '{topic}': {e}")
-                
-        return all_final_cards
-    return []
+                print(f"   [Flashcards] Failed for '{topic}': {e}")
+                return []
+
+    # Execute all topics in parallel
+    tasks = [generate_for_topic(t) for t in topics]
+    results = await asyncio.gather(*tasks)
+
+    # Flatten results
+    all_final_cards = [card for topic_cards in results for card in topic_cards]
+    print(f"   [Flashcards] Fan-Out Complete. Total generated: {len(all_final_cards)}")
+    return all_final_cards

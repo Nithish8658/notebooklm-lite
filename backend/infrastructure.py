@@ -58,8 +58,15 @@ class AppInfrastructure:
             autoflush=False
         )
         
-        # Database Guard: Industrial limit to prevent DB crash
-        self.db_semaphore = asyncio.Semaphore(80)
+        # Database Guard: Tiered Semaphore System
+        # 1. Light Semaphore (80 permits) - For enrollment checks, user fetching, etc.
+        self.db_light_semaphore = asyncio.Semaphore(80)
+        # 2. Heavy Semaphore (10 permits) - For massive metadata loads (Brain instantiation)
+        # Prevents saturating CPU/RAM with too many simultaneous BM25 reconstructions.
+        self.db_metadata_semaphore = asyncio.Semaphore(10)
+        
+        # Backward compatibility proxy for general use
+        self.db_semaphore = self.db_light_semaphore
 
     async def close(self):
         """Upgrade 2: Explicit Lifecycle Management (Graceful Shutdown)"""

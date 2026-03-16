@@ -226,41 +226,52 @@ async def generate_podcast_audio(script: List[PodcastSegment], output_path: str)
 
         merged = output_path.replace(".mp3", "_merged.wav")
 
-        subprocess.run([
+        # AC-53: Use Asynchronous Subprocess to prevent event loop blocking
+        process_concat = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y",
             "-f", "concat",
             "-safe", "0",
             "-i", str(concat_file),
             "-c:a", "pcm_s16le",
-            merged
-        ], check=True)
+            merged,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await process_concat.wait()
 
         os.remove(concat_file)
 
-        subprocess.run([
+        process_encode = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y",
             "-i", merged,
             "-c:a", "libmp3lame",
             "-b:a", "192k",
-            output_path
-        ], check=True)
+            output_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await process_encode.wait()
 
         os.remove(merged)
 
         mastered = output_path.replace(".mp3", "_mastered.mp3")
-        if audio_master.master_podcast(output_path, mastered):
+        # Mastering is CPU intensive, offload to thread
+        if await asyncio.to_thread(audio_master.master_podcast, output_path, mastered):
             os.remove(output_path)
             os.rename(mastered, output_path)
 
         return True
 
-    except Exception:
+    except Exception as e:
+        print(f"PODCAST AUDIO ERROR: {e}")
         return False
 
     finally:
         for tf in temp_files:
             if tf.exists():
-                os.remove(tf)
+                try:
+                    os.remove(tf)
+                except: pass
 
 
 # ============================================

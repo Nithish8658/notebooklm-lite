@@ -1,7 +1,7 @@
 
 import asyncio
 import time
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 import logging
 
 _LOG = logging.getLogger("reranker_batch")
@@ -88,5 +88,49 @@ class SemaphoreProxy:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         return await get_infra().db_semaphore.__aexit__(exc_type, exc_val, exc_tb)
 
-# Connection Guard for PostgreSQL (Dynamic Proxy)
+class MetadataSemaphoreProxy:
+    async def __aenter__(self):
+        return await get_infra().db_metadata_semaphore.__aenter__()
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return await get_infra().db_metadata_semaphore.__aexit__(exc_type, exc_val, exc_tb)
+
+class SingleFlightManager:
+    """
+    Prevents "Cache Stampedes" by coalescing identical concurrent requests
+    into a single execution.
+    """
+    def __init__(self):
+        self._inflight: Dict[str, asyncio.Future] = {}
+        self._lock = asyncio.Lock()
+
+    async def do(self, key: str, coro_fn, *args, **kwargs):
+        """
+        Executes coro_fn and returns the result. If another call with the same
+        key is already in flight, it waits for the first one and returns its result.
+        """
+        async with self._lock:
+            if key in self._inflight:
+                # Wait for the existing flight
+                return await self._inflight[key]
+            
+            # Start a new flight
+            future = asyncio.get_running_loop().create_future()
+            self._inflight[key] = future
+
+        try:
+            result = await coro_fn(*args, **kwargs)
+            future.set_result(result)
+            return result
+        except Exception as e:
+            future.set_exception(e)
+            raise e
+        finally:
+            async with self._lock:
+                if self._inflight.get(key) == future:
+                    del self._inflight[key]
+
+# Singletons
 db_semaphore = SemaphoreProxy()
+db_metadata_semaphore = MetadataSemaphoreProxy()
+single_flight = SingleFlightManager()

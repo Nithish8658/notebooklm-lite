@@ -255,11 +255,11 @@ export async function deleteQuiz(username, activeBatchId, topic) {
   return data;
 }
 
-export async function generateQuiz(username, activeBatchId, topic) {
+export async function generateQuiz(username, activeBatchId, topics) {
   const res = await fetch(`${BASE_URL}/studio/quiz/generate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username: username, active_batch_id: activeBatchId, topic })
+    body: JSON.stringify({ username: username, active_batch_id: activeBatchId, topics })
   });
   
   const data = await res.json();

@@ -19,20 +19,33 @@ function TopicSetter() {
   const activeTopics = useMemo(() => {
     if (mode === 'flashcards') {
       const topicCounts = {};
-      flashcards.forEach(card => {
-        topicCounts[card.topic] = (topicCounts[card.topic] || 0) + 1;
+      (flashcards || []).forEach(card => {
+        if (card && card.topic) {
+          topicCounts[card.topic] = (topicCounts[card.topic] || 0) + 1;
+        }
       });
       return Object.entries(topicCounts).map(([name, count]) => ({ name, count: `${count} Cards` }));
     } else if (mode === 'quiz') {
-      return quizzes.map(q => ({ name: q.topic, count: `${q.questions.length} Questions` }));
+      return (quizzes || [])
+        .filter(q => q && q.topic)
+        .map(q => ({ 
+          name: q.topic, 
+          count: `${(q.questions || []).length} Questions` 
+        }));
     } else {
-      return podcasts.map(p => ({ name: p.topic, count: `${p.script ? p.script.length : 0} Segments` }));
+      return (podcasts || [])
+        .filter(p => p && p.topic)
+        .map(p => ({ 
+          name: p.topic, 
+          count: `${p.script ? p.script.length : 0} Segments` 
+        }));
     }
   }, [flashcards, quizzes, podcasts, mode]);
 
   const handleGenerate = async () => {
+    // Split by commas OR newlines, then trim and filter empty
     const topics = topicInput
-      .split(',')
+      .split(/[,\n]+/)
       .map(t => t.trim())
       .filter(t => t.length > 0);
 
@@ -47,7 +60,7 @@ function TopicSetter() {
     try {
       if (mode === 'flashcards') {
         const newCards = await generateFlashcards(user.username, user.active_batch_id, topics);
-        if (newCards.length === 0) {
+        if (!newCards || newCards.length === 0) {
           setError("No content generated.");
         } else {
           setFlashcards(prev => {
@@ -59,19 +72,20 @@ function TopicSetter() {
           if (window.confirm(`${newCards.length} flashcards generated! Go to Studio?`)) navigate('/studio');
         }
       } else if (mode === 'quiz') {
-        let generatedCount = 0;
-        for (const topic of topics) {
-          const quiz = await generateQuiz(user.username, user.active_batch_id, topic);
-          if (quiz) {
-            setQuizzes(prev => [...prev, quiz]);
-            generatedCount++;
-          }
-        }
-        if (generatedCount > 0) {
+        // Updated to handle Batch Quiz Response {"quizzes": [...]}
+        const response = await generateQuiz(user.username, user.active_batch_id, topics);
+        const newQuizzes = response?.quizzes || [];
+        
+        if (newQuizzes.length > 0) {
+          setQuizzes(prev => {
+            const existingTopics = new Set(prev.map(q => q.topic));
+            const uniqueNewQuizzes = newQuizzes.filter(q => !existingTopics.has(q.topic));
+            return [...prev, ...uniqueNewQuizzes];
+          });
           setTopicInput('');
-          if (window.confirm(`${generatedCount} quizzes generated! Go to Studio?`)) navigate('/studio');
+          if (window.confirm(`${newQuizzes.length} quizzes generated! Go to Studio?`)) navigate('/studio');
         } else {
-          setError("Failed to generate quizzes.");
+          setError("Failed to generate quizzes. Ensure the topic is covered in your documents.");
         }
       } else {
         // Podcast (Background Job)

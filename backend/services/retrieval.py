@@ -74,11 +74,10 @@ async def retrieve_candidates(
         }
         
         # ---- Sparse (Sync In-Memory per Request) ----
-        sparse_scores = (
-            bm25.search(q, batch_id=batch_id, top_k=sparse_top_k)
-            if bm25
-            else {}
-        )
+        # CPU-Bound: Offload to thread
+        sparse_scores = await asyncio.to_thread(
+            bm25.search, q, batch_id=batch_id, top_k=sparse_top_k
+        ) if bm25 else {}
 
         return {
             "query": q,
@@ -160,7 +159,9 @@ async def retrieve_candidates(
     # itself was built per-batch or check after materialization.
     # To keep it truly secure, we'll fetch all candidate metadata from Qdrant.
     
-    expanded = multi_hop_expand(
+    # CPU-Bound: Offload to thread
+    expanded = await asyncio.to_thread(
+        multi_hop_expand,
         seed_scores=hybrid_scores,
         graph=graph,
         chunk_lookup={}, # We don't have lookup in memory anymore

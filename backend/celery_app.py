@@ -1,6 +1,8 @@
 import os
 from celery import Celery
 
+from celery.schedules import crontab
+
 # Use Redis as the broker and result backend
 redis_url = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
 
@@ -27,3 +29,11 @@ celery_app.conf.update(
     task_acks_late=True,
     task_reject_on_worker_lost=True,
 )
+
+# Schedule Platform Sync every 2 minutes
+celery_app.conf.beat_schedule = {
+    'sync-platform-every-2-minutes': {
+        'task': 'sync_platform',
+        'schedule': 120.0, # seconds
+    },
+}
