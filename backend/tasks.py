@@ -3,6 +3,8 @@ from celery_app import celery_app
 from main import process_ingestion_background, process_batch_ingestion_background, generate_podcast_background
 from infrastructure import init_infra, close_infra
 
+from services.platform_sync import PlatformSyncService
+
 # Celery Worker: Startup is now model-free.
 # Models will be loaded on-demand during task execution if not already present.
 print("\n--- CELERY WORKER ACTIVE ---")
@@ -18,6 +20,14 @@ async def task_lifecycle(coro):
         return await coro
     finally:
         await close_infra()
+
+@celery_app.task(name="sync_platform")
+def sync_platform_task():
+    """
+    Background task for Platform Sync & Purge cycle.
+    """
+    sync_service = PlatformSyncService()
+    asyncio.run(task_lifecycle(sync_service.run_sync_cycle()))
 
 @celery_app.task(name="process_ingestion")
 def process_ingestion_task(job_id: str, input_path: str, file_type: str, ingestion_id: str, file_id: str, filename: str, batch_id: str, mode: str = "single"):

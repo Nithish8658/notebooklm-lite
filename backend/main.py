@@ -48,8 +48,9 @@ from services.podcast import generate_podcast, PodcastRefusalError
 
 from database import init_db, get_db, User, Flashcard, Quiz, Podcast, Batch, UserEnrollment, IngestionJob, AsyncSessionLocal
 from services.index_state import index_manager
+from celery_app import celery_app
 from services.embeddings import BatchEmbeddingManager, get_embedding_model, load_embedding_model
-from services.concurrency import BatchRerankManager, db_semaphore
+from services.concurrency import BatchRerankManager, db_semaphore, single_flight
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 from fastapi import Depends
@@ -198,32 +199,12 @@ async def lifespan(app: FastAPI):
 
         threading.Thread(target=run_warmup, daemon=True).start()
         
-        # --- AUTO-SYNC STARTUP ---
-        # 1. Run one-time sync cycle for Users and Enrollments ONLY (Database only)
-        from services.platform_sync import PlatformSyncService
-        sync_service = PlatformSyncService()
-        print("STARTUP: Running initial Platform Sync (Users & Enrollments)...")
-        await sync_service.sync_users_and_enrollments()
-        print("STARTUP: Initial User Sync Complete.")
-
-        # 2. Start the Continuous Poller in a background thread
-        import threading
-        def run_continuous_poller():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            async def poller_lifecycle():
-                await init_infra()
-                try:
-                    await sync_service.start()
-                finally:
-                    await close_infra()
-            loop.run_until_complete(poller_lifecycle())
-
-        poller_thread = threading.Thread(target=run_continuous_poller, daemon=True)
-        poller_thread.start()
-        print("STARTUP: Platform Sync Service background poller active.")
+        # --- AUTO-SYNC STARTUP (Offloaded to Celery) ---
+        print("STARTUP: Offloading Platform Sync to Celery worker...")
+        celery_app.send_task("sync_platform")
+        print("STARTUP: Platform Sync Task queued.")
     except Exception as e:
-        print(f" CRITICAL ERROR during model loading: {e}")
+        print(f" CRITICAL ERROR during startup: {e}")
         traceback.print_exc()
     
     yield
@@ -384,26 +365,32 @@ class FlashcardRequest(BaseModel):
 
 @app.post("/studio/flashcards")
 async def create_flashcards(req: FlashcardRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Studio Flashcards Endpoint.
+    Uses Single-Flight to coalesce parallel topic generation.
+    """
+    sorted_topics = sorted(req.topics) if req.topics else ["general"]
+    flight_key = f"studio:flashcards:{req.active_batch_id}:{req.complexity}:{hash(tuple(sorted_topics))}"
+    
+    return await single_flight.do(flight_key, _create_flashcards_logic, req, db)
+
+async def _create_flashcards_logic(req: FlashcardRequest, db: AsyncSession):
     await verify_user_enrollment(req.username, req.active_batch_id, db)
     if not await ensure_batch_is_loaded(req.active_batch_id, db):
         raise HTTPException(status_code=400, detail="No documents indexed.")
 
     # --- SEMANTIC CACHE LOOKUP ---
-    # Normalize topics and include complexity in the cache key
     sorted_topics = sorted(req.topics) if req.topics else ["general"]
     topic_str = f"{','.join(sorted_topics)} [Level: {req.complexity}]"
     
-    # AC-45: Rate Limit - Check for 3min cooldown on empty/invalid attempts
     await check_cooldown(req.active_batch_id, topic_str, "flashcards")
 
     cached_cards = await get_semantic_cache(req.active_batch_id, topic_str, "flashcards")
     if cached_cards:
-        # Save to DB for this user too so it shows up in their list
         db.add(Flashcard(username=req.username, batch_id=req.active_batch_id, payload=cached_cards, complexity=req.complexity))
         await db.commit()
         return {"cards": cached_cards}
 
-    # Fetch Metadata (Optimized RAM Singleton)
     brain = await index_manager.get_brain(req.active_batch_id)
     if not brain:
         raise HTTPException(status_code=404, detail="Course resources not found.")
@@ -424,11 +411,8 @@ async def create_flashcards(req: FlashcardRequest, db: AsyncSession = Depends(ge
         if cards and len(cards) > 0:
             db.add(Flashcard(username=req.username, batch_id=req.active_batch_id, payload=cards, complexity=req.complexity))
             await db.commit()
-            # --- SAVE TO SEMANTIC CACHE (Background) ---
-            # Only cache proper answers
             asyncio.create_task(set_semantic_cache(req.active_batch_id, topic_str, "flashcards", cards))
         else:
-            # AC-45: Negative Cache / Cooldown - Prevent retrying for 3 mins if no info found
             await set_cooldown(req.active_batch_id, topic_str, "flashcards")
             
         return {"cards": cards}
@@ -441,31 +425,43 @@ async def get_quizzes(username: str, batch_id: str, db: AsyncSession = Depends(g
     quizzes = result.scalars().all()
     return {"quizzes": [q.payload for q in quizzes]}
 
+from pydantic import BaseModel, Field, root_validator
+
 class QuizGenerateRequest(BaseModel):
     username: str
     active_batch_id: str
-    topic: str
+    topic: Optional[str] = None # Backward compatibility
+    topics: Optional[List[str]] = None
     complexity: str = Field("Undergrad", description="Complexity level")
+
+    @root_validator(pre=True)
+    def validate_topics(cls, values):
+        topic = values.get("topic")
+        topics = values.get("topics")
+        
+        if not topics and topic:
+            values["topics"] = [topic]
+        elif not topics and not topic:
+            raise ValueError("Either 'topic' or 'topics' must be provided.")
+        return values
 
 @app.post("/studio/quiz/generate")
 async def generate_quiz_endpoint(req: QuizGenerateRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Studio Batch Quiz Endpoint.
+    Uses Multi-Dimensional Single-Flight to isolate requests by User, Batch, and Topic set.
+    """
+    sorted_topics = sorted(req.topics)
+    # AC-55: Secure Multi-Dimensional Flight Key
+    flight_key = f"studio:quiz:{req.active_batch_id}:{req.username}:{req.complexity}:{hash(tuple(sorted_topics))}"
+    
+    return await single_flight.do(flight_key, _generate_quiz_logic, req, db)
+
+async def _generate_quiz_logic(req: QuizGenerateRequest, db: AsyncSession):
     await verify_user_enrollment(req.username, req.active_batch_id, db)
     if not await ensure_batch_is_loaded(req.active_batch_id, db):
         raise HTTPException(status_code=400, detail="No documents indexed.")
 
-    # --- SEMANTIC CACHE LOOKUP ---
-    topic_with_level = f"{req.topic} [Level: {req.complexity}]"
-    
-    # AC-45: Rate Limit - Check for 3min cooldown
-    await check_cooldown(req.active_batch_id, req.topic, "quiz")
-
-    cached_quiz = await get_semantic_cache(req.active_batch_id, topic_with_level, "quiz")
-    if cached_quiz:
-        db.add(Quiz(username=req.username, batch_id=req.active_batch_id, payload=cached_quiz, complexity=req.complexity))
-        await db.commit()
-        return cached_quiz
-
-    # Fetch Metadata (Optimized RAM Singleton)
     brain = await index_manager.get_brain(req.active_batch_id)
     if not brain:
         raise HTTPException(status_code=404, detail="Course resources not found.")
@@ -473,31 +469,65 @@ async def generate_quiz_endpoint(req: QuizGenerateRequest, db: AsyncSession = De
     bm25 = brain["bm25"]
     graph = brain["graph"]
 
-    try:
-        quiz = await generate_quiz_for_topic(
-            topic=req.topic,
-            bm25=bm25,
-            graph=graph,
-            chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_batch_id),
-            dense_retrieve_fn=dense_retrieve,
-            batch_id=req.active_batch_id,
-            complexity=req.complexity
-        )
-        if quiz:
-            db.add(Quiz(username=req.username, batch_id=req.active_batch_id, payload=quiz.dict(), complexity=req.complexity))
-            await db.commit()
-            # --- SAVE TO SEMANTIC CACHE (Background) ---
-            # Only cache proper answers
-            asyncio.create_task(set_semantic_cache(req.active_batch_id, topic_with_level, "quiz", quiz.dict()))
-            return quiz.dict()
+    results = []
+    pending_topics = []
+
+    # 1. Granular Cache Resolution (Per-Topic)
+    for topic in req.topics:
+        topic_with_level = f"{topic} [Level: {req.complexity}]"
+        # Check cooldown per topic
+        try:
+            await check_cooldown(req.active_batch_id, topic, "quiz")
+        except HTTPException:
+            continue # Skip topics in cooldown
+
+        cached_quiz = await get_semantic_cache(req.active_batch_id, topic_with_level, "quiz")
+        if cached_quiz:
+            print(f"   [Quiz] Cache Hit for topic: '{topic}'")
+            # Save to DB for this specific user request
+            db.add(Quiz(username=req.username, batch_id=req.active_batch_id, payload=cached_quiz, complexity=req.complexity))
+            results.append(cached_quiz)
         else:
-            # AC-45: Negative Cache / Cooldown - Prevent retrying for 3 mins if no info found
-            await set_cooldown(req.active_batch_id, req.topic, "quiz")
-            raise HTTPException(status_code=400, detail="The provided text contains no information regarding the topic.")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            pending_topics.append(topic)
+
+    # 2. Parallel Fan-Out for Misses
+    if pending_topics:
+        print(f"   [Quiz] Cache Miss for {len(pending_topics)} topics. Starting Parallel Generation...")
+        
+        # We'll refactor the service to handle a list or call it in parallel here
+        from services.quiz import generate_quiz_for_topic
+        
+        # Internal Semaphore for LLM protection
+        sem = asyncio.Semaphore(3)
+
+        async def generate_task(topic: str):
+            async with sem:
+                quiz_obj = await generate_quiz_for_topic(
+                    topic=topic,
+                    bm25=bm25,
+                    graph=graph,
+                    chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_batch_id),
+                    dense_retrieve_fn=dense_retrieve,
+                    batch_id=req.active_batch_id,
+                    complexity=req.complexity
+                )
+                if quiz_obj:
+                    quiz_dict = quiz_obj.dict()
+                    db.add(Quiz(username=req.username, batch_id=req.active_batch_id, payload=quiz_dict, complexity=req.complexity))
+                    # Background cache save
+                    topic_level = f"{topic} [Level: {req.complexity}]"
+                    asyncio.create_task(set_semantic_cache(req.active_batch_id, topic_level, "quiz", quiz_dict))
+                    return quiz_dict
+                else:
+                    await set_cooldown(req.active_batch_id, topic, "quiz")
+                    return None
+
+        tasks = [generate_task(t) for t in pending_topics]
+        new_quizzes = await asyncio.gather(*tasks)
+        results.extend([q for q in new_quizzes if q is not None])
+
+    await db.commit()
+    return {"quizzes": results}
 
 class PodcastGenerateRequest(BaseModel):
     username: str
@@ -540,19 +570,24 @@ async def get_podcasts(username: str, batch_id: str, db: AsyncSession = Depends(
 
 @app.post("/studio/podcast/generate")
 async def generate_podcast_endpoint(req: PodcastGenerateRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Studio Podcast Endpoint.
+    Uses Single-Flight to prevent redundant Celery task dispatch.
+    """
+    flight_key = f"studio:podcast:{req.active_batch_id}:{req.complexity}:{req.topic}"
+    return await single_flight.do(flight_key, _generate_podcast_logic, req, db)
+
+async def _generate_podcast_logic(req: PodcastGenerateRequest, db: AsyncSession):
     await verify_user_enrollment(req.username, req.active_batch_id, db)
     if not await ensure_batch_is_loaded(req.active_batch_id, db):
         raise HTTPException(status_code=400, detail="No documents indexed.")
 
     # --- SEMANTIC CACHE LOOKUP ---
     topic_with_level = f"{req.topic} [Level: {req.complexity}]"
-    
-    # AC-45: Rate Limit - Check for 3min cooldown
     await check_cooldown(req.active_batch_id, req.topic, "podcast")
 
     cached_podcast = await get_semantic_cache(req.active_batch_id, topic_with_level, "podcast")
     
-    # Validation: Ensure cache has the required script and the audio file actually exists on disk
     is_cache_valid = False
     if cached_podcast:
         script_list = cached_podcast.get("script") if isinstance(cached_podcast, dict) else cached_podcast
@@ -564,7 +599,6 @@ async def generate_podcast_endpoint(req: PodcastGenerateRequest, db: AsyncSessio
                 is_cache_valid = True
                 
     if is_cache_valid:
-        # Re-verify normalize for DB insertion
         script_list = cached_podcast.get("script") if isinstance(cached_podcast, dict) else cached_podcast
         audio_path = cached_podcast.get("audio_path") if isinstance(cached_podcast, dict) else None
         
@@ -577,7 +611,6 @@ async def generate_podcast_endpoint(req: PodcastGenerateRequest, db: AsyncSessio
             complexity=req.complexity
         ))
         await db.commit()
-        # Return as a completed job so frontend knows it's ready immediately
         return JobResponse(job_id="cached", status=JobStatus.COMPLETED, filename=req.topic)
 
     # Dispatch to Celery
@@ -586,7 +619,6 @@ async def generate_podcast_endpoint(req: PodcastGenerateRequest, db: AsyncSessio
     db.add(new_job)
     await db.commit()
 
-    from celery_app import celery_app
     celery_app.send_task("generate_podcast_task", args=[
         job_id, req.username, req.active_batch_id, req.topic, req.complexity
     ])
@@ -941,7 +973,12 @@ async def verify_user_enrollment(username: str, batch_id: str, db: AsyncSession)
 async def ensure_batch_is_loaded(batch_id: str, db: AsyncSession):
     """
     Checks if the batch has its BM25/Graph metadata ready in Postgres.
+    Coalesces identical concurrent loads via Single-Flight.
     """
+    flight_key = f"load_batch:{batch_id}"
+    return await single_flight.do(flight_key, _ensure_batch_logic, batch_id, db)
+
+async def _ensure_batch_logic(batch_id: str, db: AsyncSession):
     # AC-26: Database Guard
     async with db_semaphore:
         result = await db.execute(select(Batch).where(Batch.id == batch_id))
@@ -970,11 +1007,14 @@ async def ensure_batch_is_loaded(batch_id: str, db: AsyncSession):
         new_graph = await asyncio.to_thread(build_chunk_graph, chunks)
         
         # 3. Save to DB
+        # Offload CPU-bound dictionary conversion
+        bm25_dict = await asyncio.to_thread(new_bm25.to_dict)
+        
         if not batch:
             batch = Batch(id=batch_id, name=f"Course {batch_id}")
             db.add(batch)
         
-        batch.bm25_data = new_bm25.to_dict()
+        batch.bm25_data = bm25_dict
         batch.graph_data = new_graph
         await db.commit()
         
@@ -1200,13 +1240,16 @@ async def process_ingestion_background(job_id: str, input_path: str, file_type: 
                 new_bm25 = await asyncio.to_thread(BM25ChunkIndex, all_batch_chunks)
                 new_graph = await asyncio.to_thread(build_chunk_graph, all_batch_chunks)
                 
+                # CPU-Bound Serialization: Offload to thread
+                bm25_dict = await asyncio.to_thread(new_bm25.to_dict)
+                
                 result = await db.execute(select(Batch).where(Batch.id == batch_id))
                 batch = result.scalars().first()
                 if not batch:
                     batch = Batch(id=batch_id, name=f"Course {batch_id}")
                     db.add(batch)
                 
-                batch.bm25_data = new_bm25.to_dict()
+                batch.bm25_data = bm25_dict
                 batch.graph_data = new_graph
                 await db.commit()
                 
@@ -1408,22 +1451,32 @@ async def switch_batch(req: SwitchBatchRequest, db: AsyncSession = Depends(get_d
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Unified Chat Endpoint.
+    Uses Single-Flight to coalesce identical concurrent requests.
+    """
+    # Key for single-flight: batch + complexity + tutor + message
+    flight_key = f"{req.active_batch_id}:{req.complexity}:{req.tutor_mode}:{req.message}"
+
+    return await single_flight.do(flight_key, _chat_logic, req, db)
+
+async def _chat_logic(req: ChatRequest, db: AsyncSession):
     t_start = time.time()
     print(f"\n[INFERENCE] Starting Chat Inference for user {req.username}")
-    
+
     # AC-45: Rate Limit - Check for 3min cooldown
     await check_cooldown(req.active_batch_id, req.message, "chat")
 
     await verify_user_enrollment(req.username, req.active_batch_id, db)
-    
+
     # 1. Ensure metadata is ready
     if not await ensure_batch_is_loaded(req.active_batch_id, db):
         return ChatResponse(reply="Currently we do not have the specific resources to answer this question.", citations=[])
-    
+
     # --- TIER 1: FULL RESPONSE CACHE (LLM BYPASS) ---
     response_filters = {"complexity": req.complexity, "tutor_mode": str(req.tutor_mode)}
     cached_response = await get_semantic_cache(req.active_batch_id, req.message, "chat_response", filters=response_filters)
-    
+
     if cached_response:
         print(f"   -> [TIER 1 HIT] Inference Bypassed via Response Cache in {time.time() - t_start:.2f}s")
         return ChatResponse(reply=cached_response["reply"], citations=cached_response.get("citations", []))
@@ -1431,7 +1484,7 @@ async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
     # --- TIER 2: KNOWLEDGE CONTEXT CACHE (RETRIEVAL BYPASS) ---
     candidates = None
     cached_context = await get_semantic_cache(req.active_batch_id, req.message, "chat_context")
-    
+
     if cached_context:
         print(f"   -> [TIER 2 HIT] Retrieval Bypassed via Context Cache")
         candidates = cached_context
@@ -1440,14 +1493,14 @@ async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
         brain = await index_manager.get_brain(req.active_batch_id)
         if not brain:
             return ChatResponse(reply="Currently we do not have the specific resources to answer this question.", citations=[])
-        
+
         bm25 = brain["bm25"]
         graph = brain["graph"]
 
         # 3. Full Retrieval Pipeline
         print(f"[INFERENCE PHASE 2/4] Query Rewriting")
         rewrite_result = await rewrite_query_ensemble(query=req.message, call_llm_fn=call_gemini_async)
-        
+
         print(f"[INFERENCE PHASE 3/4] Retrieval & Reranking")
         candidates = await retrieve_candidates(
             query=req.message, 
@@ -1460,20 +1513,20 @@ async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
             min_dense_score=req.min_dense_score,
             t_inference_start=t_start
         )
-        
+
         if candidates:
             # Save to Context Cache (Background) - Available for ANY complexity level
             asyncio.create_task(set_semantic_cache(req.active_batch_id, req.message, "chat_context", candidates))
 
     if not candidates: 
         return ChatResponse(reply="Currently we do not have the answer for this question.", citations=[])
-    
+
     # 4. Response Generation
     print(f"[INFERENCE PHASE 4/4] Response Generation (Complexity: {req.complexity})")
     complexity_instr = COMPLEXITY_MAP.get(req.complexity, COMPLEXITY_MAP["Undergrad"])
     tutor_instr = TUTOR_PROMPT if req.tutor_mode else "Answer clearly based on the context."
     context_text = "\n\n".join(f"[DOC_ID: {c['doc_id']}]\n{c['text']}" for c in candidates)
-    
+
     final_prompt = f"""
 Instructions:
 - {complexity_instr}
@@ -1487,11 +1540,11 @@ Question: {req.message}
 """.strip()
 
     reply = await call_gemini_async(final_prompt)
-    
+
     # Extract citations
     doc_ids = list(set([c['doc_id'] for c in candidates]))
     found_citations = [did for did in doc_ids if f"[DOC_ID: {did}]" in reply]
-    
+
     # --- SAVE TO TIER 1 CACHE (Background) ---
     NO_INFO_MSG = "Currently we do not have the answer for this question."
     if reply.strip() != NO_INFO_MSG:
