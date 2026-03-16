@@ -132,7 +132,9 @@ async def lifespan(app: FastAPI):
     # Initialize Process-Scoped Infrastructure
     await init_infra()
     
-    print("--- HW ACCELERATION DIAGNOSTICS ---")
+    # Start the metadata eviction worker
+    index_manager.start_evictor()
+    print("STARTUP: Index Metadata Evictor active.")
     try:
         import torch
         print("PyTorch Config:")
@@ -209,6 +211,9 @@ async def lifespan(app: FastAPI):
     
     yield
     # Upgrade 2: Explicit Cleanup
+    print("SHUTDOWN: Stopping Index Metadata Evictor...")
+    await index_manager.stop_evictor()
+    
     print("SHUTDOWN: Releasing all infrastructure connections...")
     await close_infra()
 
@@ -391,33 +396,34 @@ async def _create_flashcards_logic(req: FlashcardRequest, db: AsyncSession):
         await db.commit()
         return {"cards": cached_cards}
 
-    brain = await index_manager.get_brain(req.active_batch_id)
-    if not brain:
-        raise HTTPException(status_code=404, detail="Course resources not found.")
-    
-    bm25 = brain["bm25"]
-    graph = brain["graph"]
+    brain_handle = index_manager.acquire(req.active_batch_id)
+    async with brain_handle as brain:
+        if not brain:
+            raise HTTPException(status_code=404, detail="Course resources not found.")
+        
+        bm25 = brain["bm25"]
+        graph = brain["graph"]
 
-    try:
-        cards = await generate_flashcards(
-            bm25=bm25,
-            graph=graph,
-            chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_batch_id),
-            batch_id=req.active_batch_id,
-            dense_retrieve_fn=dense_retrieve,
-            topics=req.topics,
-            complexity=req.complexity
-        )
-        if cards and len(cards) > 0:
-            db.add(Flashcard(username=req.username, batch_id=req.active_batch_id, payload=cards, complexity=req.complexity))
-            await db.commit()
-            asyncio.create_task(set_semantic_cache(req.active_batch_id, topic_str, "flashcards", cards))
-        else:
-            await set_cooldown(req.active_batch_id, topic_str, "flashcards")
-            
-        return {"cards": cards}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        try:
+            cards = await generate_flashcards(
+                bm25=bm25,
+                graph=graph,
+                chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_batch_id),
+                batch_id=req.active_batch_id,
+                dense_retrieve_fn=dense_retrieve,
+                topics=req.topics,
+                complexity=req.complexity
+            )
+            if cards and len(cards) > 0:
+                db.add(Flashcard(username=req.username, batch_id=req.active_batch_id, payload=cards, complexity=req.complexity))
+                await db.commit()
+                asyncio.create_task(set_semantic_cache(req.active_batch_id, topic_str, "flashcards", cards))
+            else:
+                await set_cooldown(req.active_batch_id, topic_str, "flashcards")
+                
+            return {"cards": cards}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/studio/quizzes")
 async def get_quizzes(username: str, batch_id: str, db: AsyncSession = Depends(get_db)):
@@ -462,72 +468,73 @@ async def _generate_quiz_logic(req: QuizGenerateRequest, db: AsyncSession):
     if not await ensure_batch_is_loaded(req.active_batch_id, db):
         raise HTTPException(status_code=400, detail="No documents indexed.")
 
-    brain = await index_manager.get_brain(req.active_batch_id)
-    if not brain:
-        raise HTTPException(status_code=404, detail="Course resources not found.")
-    
-    bm25 = brain["bm25"]
-    graph = brain["graph"]
-
-    results = []
-    pending_topics = []
-
-    # 1. Granular Cache Resolution (Per-Topic)
-    for topic in req.topics:
-        topic_with_level = f"{topic} [Level: {req.complexity}]"
-        # Check cooldown per topic
-        try:
-            await check_cooldown(req.active_batch_id, topic, "quiz")
-        except HTTPException:
-            continue # Skip topics in cooldown
-
-        cached_quiz = await get_semantic_cache(req.active_batch_id, topic_with_level, "quiz")
-        if cached_quiz:
-            print(f"   [Quiz] Cache Hit for topic: '{topic}'")
-            # Save to DB for this specific user request
-            db.add(Quiz(username=req.username, batch_id=req.active_batch_id, payload=cached_quiz, complexity=req.complexity))
-            results.append(cached_quiz)
-        else:
-            pending_topics.append(topic)
-
-    # 2. Parallel Fan-Out for Misses
-    if pending_topics:
-        print(f"   [Quiz] Cache Miss for {len(pending_topics)} topics. Starting Parallel Generation...")
+    brain_handle = index_manager.acquire(req.active_batch_id)
+    async with brain_handle as brain:
+        if not brain:
+            raise HTTPException(status_code=404, detail="Course resources not found.")
         
-        # We'll refactor the service to handle a list or call it in parallel here
-        from services.quiz import generate_quiz_for_topic
-        
-        # Internal Semaphore for LLM protection
-        sem = asyncio.Semaphore(3)
+        bm25 = brain["bm25"]
+        graph = brain["graph"]
 
-        async def generate_task(topic: str):
-            async with sem:
-                quiz_obj = await generate_quiz_for_topic(
-                    topic=topic,
-                    bm25=bm25,
-                    graph=graph,
-                    chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_batch_id),
-                    dense_retrieve_fn=dense_retrieve,
-                    batch_id=req.active_batch_id,
-                    complexity=req.complexity
-                )
-                if quiz_obj:
-                    quiz_dict = quiz_obj.dict()
-                    db.add(Quiz(username=req.username, batch_id=req.active_batch_id, payload=quiz_dict, complexity=req.complexity))
-                    # Background cache save
-                    topic_level = f"{topic} [Level: {req.complexity}]"
-                    asyncio.create_task(set_semantic_cache(req.active_batch_id, topic_level, "quiz", quiz_dict))
-                    return quiz_dict
-                else:
-                    await set_cooldown(req.active_batch_id, topic, "quiz")
-                    return None
+        results = []
+        pending_topics = []
 
-        tasks = [generate_task(t) for t in pending_topics]
-        new_quizzes = await asyncio.gather(*tasks)
-        results.extend([q for q in new_quizzes if q is not None])
+        # 1. Granular Cache Resolution (Per-Topic)
+        for topic in req.topics:
+            topic_with_level = f"{topic} [Level: {req.complexity}]"
+            # Check cooldown per topic
+            try:
+                await check_cooldown(req.active_batch_id, topic, "quiz")
+            except HTTPException:
+                continue # Skip topics in cooldown
 
-    await db.commit()
-    return {"quizzes": results}
+            cached_quiz = await get_semantic_cache(req.active_batch_id, topic_with_level, "quiz")
+            if cached_quiz:
+                print(f"   [Quiz] Cache Hit for topic: '{topic}'")
+                # Save to DB for this specific user request
+                db.add(Quiz(username=req.username, batch_id=req.active_batch_id, payload=cached_quiz, complexity=req.complexity))
+                results.append(cached_quiz)
+            else:
+                pending_topics.append(topic)
+
+        # 2. Parallel Fan-Out for Misses
+        if pending_topics:
+            print(f"   [Quiz] Cache Miss for {len(pending_topics)} topics. Starting Parallel Generation...")
+            
+            # We'll refactor the service to handle a list or call it in parallel here
+            from services.quiz import generate_quiz_for_topic
+            
+            # Internal Semaphore for LLM protection
+            sem = asyncio.Semaphore(3)
+
+            async def generate_task(topic: str):
+                async with sem:
+                    quiz_obj = await generate_quiz_for_topic(
+                        topic=topic,
+                        bm25=bm25,
+                        graph=graph,
+                        chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_batch_id),
+                        dense_retrieve_fn=dense_retrieve,
+                        batch_id=req.active_batch_id,
+                        complexity=req.complexity
+                    )
+                    if quiz_obj:
+                        quiz_dict = quiz_obj.dict()
+                        db.add(Quiz(username=req.username, batch_id=req.active_batch_id, payload=quiz_dict, complexity=req.complexity))
+                        # Background cache save
+                        topic_level = f"{topic} [Level: {req.complexity}]"
+                        asyncio.create_task(set_semantic_cache(req.active_batch_id, topic_level, "quiz", quiz_dict))
+                        return quiz_dict
+                    else:
+                        await set_cooldown(req.active_batch_id, topic, "quiz")
+                        return None
+
+            tasks = [generate_task(t) for t in pending_topics]
+            new_quizzes = await asyncio.gather(*tasks)
+            results.extend([q for q in new_quizzes if q is not None])
+
+        await db.commit()
+        return {"quizzes": results}
 
 class PodcastGenerateRequest(BaseModel):
     username: str
@@ -632,22 +639,23 @@ async def generate_podcast_background(job_id: str, username: str, batch_id: str,
             if not await ensure_batch_is_loaded(batch_id, db):
                  raise RuntimeError("Batch metadata not ready.")
 
-        # 2. Fetch Metadata (RAM Singleton)
-        brain = await index_manager.get_brain(batch_id)
-        if not brain: raise RuntimeError("Course resources not found.")
-        
-        bm25 = brain["bm25"]
-        graph = brain["graph"]
+        # 2. Fetch Metadata (RAM Lifecycle Lease)
+        brain_handle = index_manager.acquire(batch_id)
+        async with brain_handle as brain:
+            if not brain: raise RuntimeError("Course resources not found.")
+            
+            bm25 = brain["bm25"]
+            graph = brain["graph"]
 
-        podcast = await generate_podcast(
-            topic=topic,
-            bm25=bm25,
-            graph=graph,
-            chunk_fetcher=lambda ids: fetch_chunk_details(ids, batch_id),
-            dense_retrieve_fn=dense_retrieve,
-            batch_id=batch_id,
-            complexity=complexity
-        )
+            podcast = await generate_podcast(
+                topic=topic,
+                bm25=bm25,
+                graph=graph,
+                chunk_fetcher=lambda ids: fetch_chunk_details(ids, batch_id),
+                dense_retrieve_fn=dense_retrieve,
+                batch_id=batch_id,
+                complexity=complexity
+            )
         
         if not podcast:
             raise RuntimeError("Not enough resource to generate podcast")
@@ -716,8 +724,6 @@ async def generate_podcast_background(job_id: str, username: str, batch_id: str,
                 job.status = JobStatus.FAILED
                 job.message = str(e)
                 await db.commit()
-    finally:
-        await close_infra()
 
 # ===== DELETE STUDIO TOOLS =====
 @app.delete("/studio/flashcards")
@@ -1489,34 +1495,35 @@ async def _chat_logic(req: ChatRequest, db: AsyncSession):
         print(f"   -> [TIER 2 HIT] Retrieval Bypassed via Context Cache")
         candidates = cached_context
     else:
-        # 2. Fetch Metadata (IMS RAM Brain)
-        brain = await index_manager.get_brain(req.active_batch_id)
-        if not brain:
-            return ChatResponse(reply="Currently we do not have the specific resources to answer this question.", citations=[])
+        # 2. Fetch Metadata (IMS RAM Lifecycle Lease)
+        brain_handle = index_manager.acquire(req.active_batch_id)
+        async with brain_handle as brain:
+            if not brain:
+                return ChatResponse(reply="Currently we do not have the specific resources to answer this question.", citations=[])
 
-        bm25 = brain["bm25"]
-        graph = brain["graph"]
+            bm25 = brain["bm25"]
+            graph = brain["graph"]
 
-        # 3. Full Retrieval Pipeline
-        print(f"[INFERENCE PHASE 2/4] Query Rewriting")
-        rewrite_result = await rewrite_query_ensemble(query=req.message, call_llm_fn=call_gemini_async)
+            # 3. Full Retrieval Pipeline
+            print(f"[INFERENCE PHASE 2/4] Query Rewriting")
+            rewrite_result = await rewrite_query_ensemble(query=req.message, call_llm_fn=call_gemini_async)
 
-        print(f"[INFERENCE PHASE 3/4] Retrieval & Reranking")
-        candidates = await retrieve_candidates(
-            query=req.message, 
-            rewrites=rewrite_result["rewrites"], 
-            bm25=bm25,
-            graph=graph,
-            chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_batch_id),
-            dense_fn=dense_retrieve, 
-            batch_id=req.active_batch_id, 
-            min_dense_score=req.min_dense_score,
-            t_inference_start=t_start
-        )
+            print(f"[INFERENCE PHASE 3/4] Retrieval & Reranking")
+            candidates = await retrieve_candidates(
+                query=req.message, 
+                rewrites=rewrite_result["rewrites"], 
+                bm25=bm25,
+                graph=graph,
+                chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_batch_id),
+                dense_fn=dense_retrieve, 
+                batch_id=req.active_batch_id, 
+                min_dense_score=req.min_dense_score,
+                t_inference_start=t_start
+            )
 
-        if candidates:
-            # Save to Context Cache (Background) - Available for ANY complexity level
-            asyncio.create_task(set_semantic_cache(req.active_batch_id, req.message, "chat_context", candidates))
+            if candidates:
+                # Save to Context Cache (Background) - Available for ANY complexity level
+                asyncio.create_task(set_semantic_cache(req.active_batch_id, req.message, "chat_context", candidates))
 
     if not candidates: 
         return ChatResponse(reply="Currently we do not have the answer for this question.", citations=[])
