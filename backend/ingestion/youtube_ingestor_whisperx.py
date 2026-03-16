@@ -9,7 +9,6 @@ from pathlib import Path
 import json
 import sys
 import time
-from pathlib import Path
 
 # Add backend to sys.path if not present for torchaudio_patch
 backend_dir = str(Path(__file__).parent.parent)
@@ -38,8 +37,11 @@ try:
     import torch
     import gc
     import pandas as pd
+    # AC-105: OpenVINO Industrial Acceleration
+    from optimum.intel.openvino import OVModelForSpeechSeq2Seq
+    from transformers import AutoProcessor, pipeline
 except ImportError as e:
-    print(f"DEBUG: Failed to import whisperx: {e}")
+    print(f"DEBUG: Failed to import dependencies (whisperx/optimum): {e}")
 
 # ==============================================================================
 # CONFIGURATION
@@ -55,15 +57,8 @@ SILENCE_GAP_THRESHOLD = 1.2
 DEFAULT_CONFIDENCE = 0.75
 
 # Device configuration
-# We delay checking torch availability until needed or default to cpu if missing
-DEVICE = "cpu"
-COMPUTE_TYPE = "int8"
-
-if torch is not None:
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    COMPUTE_TYPE = "float16" if torch.cuda.is_available() else "int8"
-
-BATCH_SIZE = 16 # Adjust based on VRAM
+DEVICE = "cpu" # lowercase for PyTorch/Transformers compatibility
+COMPUTE_TYPE = "int4" # Optimization 3: INT4 Quantization
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +104,6 @@ def download_audio_from_youtube(url: str, temp_dir: Path) -> Path:
 
     # Check for local FFmpeg binaries to avoid system PATH issues
     ffmpeg_location = None
-    # Add ingestion directory itself to possible paths
     script_dir = Path(__file__).parent.absolute()
     possible_paths = [
         script_dir / "ffmpeg.exe",
@@ -129,31 +123,22 @@ def download_audio_from_youtube(url: str, temp_dir: Path) -> Path:
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': output_template,
-
-        # Download efficiency
         'concurrent_fragment_downloads': 10,
-
-        # Audio extraction
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'wav',
         }],
-
-        # Enforce ASR-safe audio
         'postprocessor_args': [
             '-ac', '1',                 # mono
             '-ar', '16000',              # 16 kHz
             '-acodec', 'pcm_s16le',      # explicit PCM 16-bit
         ],
-
-        # Stability & debugging
-        'quiet': False,                 # DO NOT suppress during development
+        'quiet': False,
         'no_warnings': False,
         'ignoreerrors': False,
-        'noplaylist': True,             # CRITICAL: Prevent downloading 1000+ videos if URL is part of a playlist
+        'noplaylist': True,
     }
 
-    
     if ffmpeg_location:
         ydl_opts['ffmpeg_location'] = ffmpeg_location
 
@@ -161,12 +146,10 @@ def download_audio_from_youtube(url: str, temp_dir: Path) -> Path:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             video_id = info.get('id', 'unknown')
-            # yt-dlp post-processing changes extension to .wav
             expected_filename = f"{video_id}.wav"
             output_path = temp_dir / expected_filename
             
             if not output_path.exists():
-                # Fallback: find any wav in the dir if exact match fails
                 wavs = list(temp_dir.glob("*.wav"))
                 if wavs:
                     return wavs[0]
@@ -178,177 +161,138 @@ def download_audio_from_youtube(url: str, temp_dir: Path) -> Path:
         raise RuntimeError(f"yt-dlp failed: {str(e)}")
 
 # ==============================================================================
-# PHASE 2: TRANSCRIPTION & DIARIZATION (WhisperX)
+# PHASE 2: TRANSCRIPTION (OpenVINO Optimized)
 # ==============================================================================
 
 def load_whisperx_model():
-    """Helper to load the model with compatibility patches."""
-    if whisperx is None:
-        raise ImportError("The 'whisperx' library is missing.")
-    
-    # Fix: Define local model path relative to backend/
+    """
+    Optimization 1 & 3: Load Native OpenVINO Whisper with INT4 Quantization.
+    Replaces standard WhisperX load with Optimum-Intel.
+    """
+    model_id = "openai/whisper-small"
     project_root = Path(__file__).parent.parent
-    model_dir = project_root / "models" / "whisper-small"
+    model_dir = project_root / "models" / "whisper-small-ov-int4"
     model_dir.mkdir(parents=True, exist_ok=True)
     
-    logger.info(f"Loading WhisperX model (small) on {DEVICE}...")
-    logger.info(f"Model cache directory: {model_dir}")
+    logger.info(f"Loading OpenVINO Native Whisper (INT4) on {DEVICE}...")
     
-    from unittest.mock import patch
-    original_load = torch.load
-
-    def unsafe_load(*args, **kwargs):
-        if 'weights_only' in kwargs:
-            kwargs['weights_only'] = False
-        return original_load(*args, **kwargs)
-
     try:
-        with patch('torch.load', side_effect=unsafe_load):
-            model = whisperx.load_model("small", DEVICE, compute_type=COMPUTE_TYPE, download_root=str(model_dir))
-        return model
+        # Load OpenVINO model with INT4 weights
+        model = OVModelForSpeechSeq2Seq.from_pretrained(
+            model_id,
+            device=DEVICE,
+            load_in_4bit=True, # Optimization 3
+            export=True,       # Optimization 1
+            compile=True,
+            cache_dir=str(model_dir)
+        )
+        processor = AutoProcessor.from_pretrained(model_id)
+        
+        # Wrap in a HF Pipeline for seamless transcription
+        pipe = pipeline(
+            "automatic-speech-recognition",
+            model=model,
+            tokenizer=processor.tokenizer,
+            feature_extractor=processor.feature_extractor,
+            chunk_length_s=30,
+            device=DEVICE,
+        )
+        return pipe
     except Exception as e:
-        logger.warning(f"Patching torch.load failed, trying direct load: {e}")
-        return whisperx.load_model("small", DEVICE, compute_type=COMPUTE_TYPE, download_root=str(model_dir))
+        logger.error(f"OpenVINO Model Load Failed: {e}")
+        raise RuntimeError(f"Failed to initialize OpenVINO hardware acceleration: {e}")
 
 def transcribe_with_whisperx(audio_path: Path, model=None) -> Dict[str, Any]:
     """
-    Runs the full WhisperX pipeline: 
-    Transcribe -> Align -> Diarize -> Assign Speakers.
-    
-    Returns a dictionary containing segments with word-level timestamps and speakers.
+    Runs the optimized OpenVINO Pipeline.
+    Optimization 2: Alignment is skipped entirely.
     """
-    if whisperx is None:
-        raise ImportError("The 'whisperx' library is missing. Please run: pip install git+https://github.com/m-bain/whisperx.git")
-
     audio_file = str(audio_path)
     
-    # --- FFmpeg PATH FIX ---
-    # WhisperX assumes ffmpeg is in PATH. We temporarily add our local bin.
-    # We reuse the discovery logic 
-    script_dir = Path(__file__).parent.absolute()
-    local_ffmpeg = script_dir / "ffmpeg.exe"
-    if not local_ffmpeg.exists():
-        # Try fallbacks if moved
-        local_ffmpeg = Path("ffmpeg.exe").absolute()
-    
-    old_path = os.environ.get("PATH", "")
-    if local_ffmpeg.exists():
-        ffmpeg_dir = str(local_ffmpeg.parent)
-        if ffmpeg_dir not in old_path:
-            logger.info(f"Temporarily adding {ffmpeg_dir} to PATH for WhisperX")
-            os.environ["PATH"] = f"{ffmpeg_dir}{os.pathsep}{old_path}"
-
     try:
-        # 1. Transcribe (ASR)
         t_start_p2 = time.time()
-        should_cleanup = False
+        
+        # 1. Load Model (On-demand if not pre-cached)
         if model is None:
-            logger.info("[PHASE 2.1] Loading WhisperX Model...")
-            t_model_load = time.time()
+            logger.info("[PHASE 2.1] Initializing OpenVINO Hardware Acceleration...")
             model = load_whisperx_model()
-            should_cleanup = True
-            logger.info(f"[PHASE 2.1] Model Load Time: {time.time() - t_model_load:.2f}s")
         
-        logger.info("[PHASE 2.2] Loading Audio into Memory...")
-        t_audio_load = time.time()
-        audio = whisperx.load_audio(audio_file)
-        logger.info(f"[PHASE 2.2] Audio Load Time: {time.time() - t_audio_load:.2f}s")
-
-        logger.info("[PHASE 2.3] Starting ASR (Transcription)...")
-        # Reverted: Now allowing automatic language detection
+        # 2. Transcribe (Native OpenVINO)
+        logger.info("[PHASE 2.3] Starting ASR (OpenVINO INT4)...")
         t_asr = time.time()
-        result = model.transcribe(audio, batch_size=BATCH_SIZE)
+        
+        # Optimization: Pin language to 'en' to skip 17s detection overhead
+        # Note: In a production env, this could be passed as a param
+        result = model(
+            audio_file, 
+            return_timestamps=True, 
+            generate_kwargs={"language": "en", "task": "transcribe"}
+        )
+        
         logger.info(f"[PHASE 2.3] ASR Execution Time: {time.time() - t_asr:.2f}s")
-        
-        # Cleanup ASR model ONLY if we loaded it locally
-        if should_cleanup:
-            del model
-            gc.collect()
-            if DEVICE == "cuda":
-                torch.cuda.empty_cache()
 
-        # 2. Alignment (Forced Alignment)
-        logger.info(f"[PHASE 2.4] Aligning transcript for language: {result['language']}...")
+        # 3. Schema Mapping (Map OV format to Legacy WhisperX format)
+        # OV Output: {"text": "...", "chunks": [{"timestamp": (s, e), "text": "..."}]}
+        # WhisperX Input for Phase 3: {"segments": [{"start": s, "end": e, "text": "...", "words": [...]}]}
         
-        project_root = Path(__file__).parent.parent
-        align_model_dir = project_root / "models" / "alignment"
-        align_model_dir.mkdir(parents=True, exist_ok=True)
+        segments = []
+        for chunk in result.get("chunks", []):
+            start, end = chunk["timestamp"]
+            # Optimization 2: Use segment-level data directly (Skip Alignment)
+            segments.append({
+                "start": start,
+                "end": end or start + 5.0, # Fallback for open-ended segments
+                "text": chunk["text"],
+                "speaker": "SPEAKER_00",
+                "words": [] # Alignment skipped, so word-level is empty
+            })
+            
+        logger.info(f"Phase 2 Optimized Total Time: {time.time() - t_start_p2:.2f}s (Alignment Skipped)")
         
-        t_align_load = time.time()
-        model_a, metadata = whisperx.load_align_model(
-            language_code=result["language"], 
-            device=DEVICE,
-            model_dir=str(align_model_dir)
-        )
-        logger.info(f"[PHASE 2.4] Alignment Model Load Time: {time.time() - t_align_load:.2f}s")
-
-        logger.info("[PHASE 2.5] Starting Alignment...")
-        t_align_exec = time.time()
-        result = whisperx.align(
-            result["segments"], 
-            model_a, 
-            metadata, 
-            audio, 
-            DEVICE, 
-            return_char_alignments=False
-        )
-        logger.info(f"[PHASE 2.5] Alignment Execution Time: {time.time() - t_align_exec:.2f}s")
+        return {"segments": segments, "language": "en"}
         
-        # Cleanup Alignment model
-        del model_a
-        gc.collect()
-        if DEVICE == "cuda":
-            torch.cuda.empty_cache()
-
-        # 3. Diarization (SKIP - Performance Optimization)
-        logger.info("[PHASE 2.6] INDUSTRIAL OPTIMIZATION: Skipping Diarization.")
-        for seg in result["segments"]:
-            seg["speaker"] = "SPEAKER_00"
-            if "words" in seg:
-                for word in seg["words"]:
-                    word["speaker"] = "SPEAKER_00"
-        
-        logger.info(f"Phase 2 Total Time: {time.time() - t_start_p2:.2f}s")
-        return result
-    finally:
-        # Restore PATH
-        os.environ["PATH"] = old_path
+    except Exception as e:
+        logger.error(f"Transcription Failed: {e}")
+        return {"segments": [], "language": "en"}
 
 # ==============================================================================
-# PHASE 3: SEGMENT NORMALIZATION (Flattening & Regrouping)
+# PHASE 3: SEGMENT NORMALIZATION (Adapted for Segment-Level Timestamps)
 # ==============================================================================
 
 def flatten_words(whisper_result: Dict[str, Any]) -> List[Dict]:
     """
-    Extracts a flat list of words from the hierarchical WhisperX result.
-    Filters out words missing timestamps.
+    Extracts a flat list of units from the Whisper result.
+    ADAPTED: Now handles both word-level (legacy) and segment-level (OpenVINO) data.
     """
-    all_words = []
+    all_units = []
     segments = whisper_result.get("segments", [])
     
     for seg in segments:
-        # Some segments might lack 'words' if alignment failed slightly
         words = seg.get("words", [])
         
-        # Fallback: if no word-level timestamps, construct pseudo-words from segment?
-        # For this strict pipeline, we prefer skipping unaligned content or utilizing segment level
-        # if word level is totally missing. Ideally WhisperX alignment works.
-        
-        default_speaker = seg.get("speaker", "SPEAKER_UNKNOWN")
-        
-        for w in words:
-            if "start" in w and "end" in w:
-                w_obj = {
-                    "word": w["word"],
-                    "start": w["start"],
-                    "end": w["end"],
-                    "score": w.get("score", 0.0),
-                    # Prefer word speaker, fall back to segment speaker
-                    "speaker": w.get("speaker", default_speaker)
-                }
-                all_words.append(w_obj)
+        if words:
+            # Legacy Path (Word-level timestamps present)
+            for w in words:
+                if "start" in w and "end" in w:
+                    all_units.append({
+                        "word": w["word"],
+                        "start": w["start"],
+                        "end": w["end"],
+                        "score": w.get("score", 0.0),
+                        "speaker": w.get("speaker", seg.get("speaker", "SPEAKER_00"))
+                    })
+        else:
+            # Optimized Path: Use the Segment itself as the base unit
+            # Since alignment is skipped, the segment is our smallest timestamped unit.
+            all_units.append({
+                "word": seg["text"], # The "unit" is the whole segment text
+                "start": seg["start"],
+                "end": seg["end"],
+                "score": DEFAULT_CONFIDENCE,
+                "speaker": seg.get("speaker", "SPEAKER_00")
+            })
             
-    return sorted(all_words, key=lambda x: x["start"])
+    return sorted(all_units, key=lambda x: x["start"])
 
 def normalize_segments(words: List[Dict]) -> List[Dict]:
     """
@@ -428,26 +372,34 @@ def create_blocks(
     final_output = []
     
     for i, seg in enumerate(normalized_segments):
-        words = seg["words"]
+        words = seg.get("words", [])
         
-        # Reconstruct text with proper punctuation spacing
-        # WhisperX words often include punctuation, or we simply join with space.
-        # Ideally, we verify punctuation attachment, but simple join is standard for Whisper word-level.
-        text_content = " ".join([w["word"].strip() for w in words]).strip()
+        # Optimization 2 Recovery: If alignment was skipped, words is empty.
+        # We reconstruct the text from the segment's summarized content (stored in 'word' by flatten_words)
+        if not words:
+            # When alignment is skipped, flatten_words puts the segment text into a single unit's 'word' field.
+            # We must ensure we don't end up with empty text.
+            text_content = " ".join([w.get("word", "").strip() for w in words]).strip()
+            if not text_content and "text" in seg: # Fallback to segment-level text if available
+                text_content = seg["text"].strip()
+            
+            # Format Metadata Words (Placeholder for segment-level block)
+            metadata_words = [{"w": text_content, "s": seg["start"], "e": seg["end"]}]
+        else:
+            # Reconstruct text with proper punctuation spacing
+            text_content = " ".join([w["word"].strip() for w in words]).strip()
+            metadata_words = [
+                {"w": w["word"], "s": w["start"], "e": w["end"]}
+                for w in words
+            ]
         
         # Calculate Average Confidence
-        # Fallback to DEFAULT_CONFIDENCE if score is missing
-        scores = [w.get("score", DEFAULT_CONFIDENCE) for w in words]
+        scores = [w.get("score", DEFAULT_CONFIDENCE) for w in (words or [{"score": DEFAULT_CONFIDENCE}])]
         avg_confidence = sum(scores) / len(scores) if scores else DEFAULT_CONFIDENCE
         
-        # Format Metadata Words
-        metadata_words = [
-            {"w": w["word"], "s": w["start"], "e": w["end"]}
-            for w in words
-        ]
         block = {
             "document_id": document_id,
-            "page": None, # YouTube has no pages
+            "page": None,
             "block_id": _generate_block_id(),
             "block_type": "paragraph",
             "text": text_content,
@@ -457,15 +409,13 @@ def create_blocks(
             "metadata": {
                 "start_time": seg["start"],
                 "end_time": seg["end"],
-                "speaker": seg["speaker"],
+                "speaker": seg.get("speaker", "SPEAKER_00"),
                 "words": metadata_words
-                
             }
         }
         
-        
         final_output.append(block)
-        print(f"Created block {block['block_id']} with {len(words)} words, speaker {seg['speaker']}, duration {seg['end'] - seg['start']:.2f}s")
+        logger.info(f"Created block {block['block_id']} with {len(text_content.split())} words, speaker {block['metadata']['speaker']}, duration {seg['end'] - seg['start']:.2f}s")
         
     return final_output
 
