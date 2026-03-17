@@ -4,6 +4,7 @@ import uuid
 import tempfile
 import shutil
 import math
+import asyncio
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 import json
@@ -167,25 +168,49 @@ def download_audio_from_youtube(url: str, temp_dir: Path) -> Path:
 def load_whisperx_model():
     """
     Optimization 1 & 3: Load Native OpenVINO Whisper with INT4 Quantization.
-    Replaces standard WhisperX load with Optimum-Intel.
+    Implements 'Smart Load': Only exports if local optimized files are missing.
     """
     model_id = "openai/whisper-small"
-    project_root = Path(__file__).parent.parent
+    # Use .resolve() to ensure absolute pathing regardless of CWD
+    project_root = Path(__file__).parent.parent.resolve()
     model_dir = project_root / "models" / "whisper-small-ov-int4"
     model_dir.mkdir(parents=True, exist_ok=True)
     
-    logger.info(f"Loading OpenVINO Native Whisper (INT4) on {DEVICE}...")
+    # Check if optimized IR files already exist (Whisper has encoder/decoder components)
+    ov_model_path = model_dir / "openvino_encoder_model.xml"
     
     try:
-        # Load OpenVINO model with INT4 weights
-        model = OVModelForSpeechSeq2Seq.from_pretrained(
-            model_id,
-            device=DEVICE,
-            load_in_4bit=True, # Optimization 3
-            export=True,       # Optimization 1
-            compile=True,
-            cache_dir=str(model_dir)
-        )
+        t_load = time.time()
+        if ov_model_path.exists():
+            logger.info(f"IMS HIT: Loading Optimized OpenVINO Whisper from {model_dir}...")
+            # Load existing local IR (Instant startup)
+            model = OVModelForSpeechSeq2Seq.from_pretrained(
+                str(model_dir),
+                device=DEVICE,
+                compile=True
+            )
+        else:
+            logger.info(f"IMS MISS: Exporting OpenVINO Native Whisper (INT4) on {DEVICE}...")
+            # One-time heavy export and quantization
+            model = OVModelForSpeechSeq2Seq.from_pretrained(
+                model_id,
+                device=DEVICE,
+                load_in_4bit=True, 
+                export=True,       
+                compile=True,
+                cache_dir=str(model_dir)
+            )
+            # Save for future near-instant boots
+            model.save_pretrained(str(model_dir))
+            logger.info(f"OpenVINO Model Exported and Saved to {model_dir}")
+
+        logger.info(f"OpenVINO Model Ready in {time.time() - t_load:.2f}s")
+        
+        # AC-105: CRITICAL FIX - Resolve Generation Conflict
+        # Clear forced_decoder_ids to prevent contradiction with return_timestamps=True
+        model.generation_config.forced_decoder_ids = None
+        model.config.forced_decoder_ids = None
+
         processor = AutoProcessor.from_pretrained(model_id)
         
         # Wrap in a HF Pipeline for seamless transcription
@@ -195,7 +220,8 @@ def load_whisperx_model():
             tokenizer=processor.tokenizer,
             feature_extractor=processor.feature_extractor,
             chunk_length_s=30,
-            device=DEVICE,
+            batch_size=1, # Optimization: Sequential processing for CPU stability
+            device=DEVICE
         )
         return pipe
     except Exception as e:
@@ -207,6 +233,11 @@ def transcribe_with_whisperx(audio_path: Path, model=None) -> Dict[str, Any]:
     Runs the optimized OpenVINO Pipeline.
     Optimization 2: Alignment is skipped entirely.
     """
+    import warnings
+    # Suppress noisy Transformers/Tracer warnings
+    warnings.filterwarnings("ignore", category=UserWarning)
+    warnings.filterwarnings("ignore", message=".*TracerWarning.*")
+    
     audio_file = str(audio_path)
     
     try:
@@ -221,14 +252,19 @@ def transcribe_with_whisperx(audio_path: Path, model=None) -> Dict[str, Any]:
         logger.info("[PHASE 2.3] Starting ASR (OpenVINO INT4)...")
         t_asr = time.time()
         
-        # Optimization: Pin language to 'en' to skip 17s detection overhead
-        # Note: In a production env, this could be passed as a param
-        result = model(
-            audio_file, 
-            return_timestamps=True, 
-            generate_kwargs={"language": "en", "task": "transcribe"}
-        )
-        
+        # AC-105: Offload to thread to prevent Event Loop Starvation during heavy inference
+        def run_inference():
+            return model(
+                audio_file, 
+                return_timestamps=True, 
+                generate_kwargs={
+                    "language": "en", 
+                    "task": "transcribe"
+                }
+            )
+            
+        result = asyncio.run(asyncio.to_thread(run_inference))
+
         logger.info(f"[PHASE 2.3] ASR Execution Time: {time.time() - t_asr:.2f}s")
 
         # 3. Schema Mapping (Map OV format to Legacy WhisperX format)

@@ -201,10 +201,8 @@ async def lifespan(app: FastAPI):
 
         threading.Thread(target=run_warmup, daemon=True).start()
         
-        # --- AUTO-SYNC STARTUP (Offloaded to Celery) ---
-        print("STARTUP: Offloading Platform Sync to Celery worker...")
-        celery_app.send_task("sync_platform")
-        print("STARTUP: Platform Sync Task queued.")
+        # --- AUTO-SYNC STARTUP (Managed by Celery Beat) ---
+        print("STARTUP: Platform Sync is managed by Celery beat (2m interval).")
     except Exception as e:
         print(f" CRITICAL ERROR during startup: {e}")
         traceback.print_exc()
@@ -332,18 +330,75 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 # ===== METRICS =====
 @app.get("/metrics")
-async def get_performance_metrics():
+async def get_performance_metrics(range: str = "24h"):
     raw_metrics = get_metrics()
-    llm_metrics = [m for m in raw_metrics if m.get("category") == "llm"]
+    
+    # 1. Calculate time threshold
+    now = datetime.datetime.now()
+    if range == "1h":
+        delta = datetime.timedelta(hours=1)
+        group_by = "minute"
+    elif range == "7d":
+        delta = datetime.timedelta(days=7)
+        group_by = "day"
+    elif range == "30d":
+        delta = datetime.timedelta(days=30)
+        group_by = "day"
+    else: # 24h
+        delta = datetime.timedelta(days=1)
+        group_by = "hour"
+        
+    threshold = now - delta
+    
+    # 2. Filter and Process
+    filtered_raw = []
+    llm_metrics = []
+    
+    for m in raw_metrics:
+        try:
+            ts = datetime.datetime.fromisoformat(m.get("timestamp"))
+            if ts >= threshold:
+                filtered_raw.append(m)
+                if m.get("category") == "llm":
+                    llm_metrics.append(m)
+        except: continue
+
+    prompt_tokens = sum(m.get("metadata", {}).get("prompt_tokens", 0) for m in llm_metrics)
+    candidates_tokens = sum(m.get("metadata", {}).get("candidates_tokens", 0) for m in llm_metrics)
     total_tokens = sum(m.get("metadata", {}).get("total_tokens", 0) for m in llm_metrics)
     estimated_cost = (total_tokens / 1_000_000) * 0.10
+    
+    # 3. Aggregate Chart Data
+    chart_data = []
+    agg = {}
+    
+    for m in llm_metrics:
+        ts = datetime.datetime.fromisoformat(m.get("timestamp"))
+        if group_by == "minute":
+            key = ts.strftime("%H:%M")
+        elif group_by == "hour":
+            key = ts.strftime("%H:00")
+        else: # day
+            key = ts.strftime("%Y-%m-%d")
+            
+        if key not in agg:
+            agg[key] = {"time": key, "calls": 0, "tokens": 0}
+        
+        agg[key]["calls"] += 1
+        agg[key]["tokens"] += m.get("metadata", {}).get("total_tokens", 0)
+        
+    chart_data = sorted(list(agg.values()), key=lambda x: x["time"])
+
     return {
-        "raw": raw_metrics[-100:],
+        "raw": filtered_raw[-100:],
         "summary": {
             "total_calls": len(llm_metrics),
             "total_tokens": total_tokens,
+            "prompt_tokens": prompt_tokens,
+            "candidates_tokens": candidates_tokens,
             "estimated_cost_usd": round(estimated_cost, 4)
-        }
+        },
+        "chart_data": chart_data
     }
 
 @app.delete("/metrics")
@@ -838,6 +893,7 @@ async def deactivate_sources(req: ActivateRequest):
 
 @app.delete("/sources/{document_id}")
 async def delete_source(document_id: str, db: AsyncSession = Depends(get_db)):
+    print(f"DEBUG: Deleting source {document_id}")
     try:
         # 1. Fetch metadata for physical deletion
         from qdrant_client.models import Filter, FieldCondition, MatchValue
@@ -880,6 +936,7 @@ async def delete_source(document_id: str, db: AsyncSession = Depends(get_db)):
             
         return {"status": "success"}
     except Exception as e:
+        print(f"ERROR: Failed to delete source {document_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/sources")

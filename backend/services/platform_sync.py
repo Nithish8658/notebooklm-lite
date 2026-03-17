@@ -5,6 +5,7 @@ import sqlite3
 import requests
 import logging
 import asyncio
+import uuid
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -13,7 +14,7 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from database import AsyncSessionLocal, User, Batch, UserEnrollment
 from sqlalchemy import select, delete
-from infrastructure import qdrant
+from infrastructure import qdrant, redis_client
 
 # Load env vars for configuration
 load_dotenv()
@@ -41,12 +42,16 @@ PASSWORD = os.getenv("PLATFORM_PASSWORD")
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE_DIR, "platform_sync.db") 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "120")) # Default 2 minutes
-
 class PlatformSyncService:
     def __init__(self):
         self.access_token = None
         self.batch_name_map = {} # Lookup for batchId -> courseName
+        self.current_cycle_id = None
         self._init_db()
+
+    def _log(self, msg, level=logging.INFO, *args):
+        prefix = f"[Cycle: {self.current_cycle_id}] " if self.current_cycle_id else ""
+        logger.log(level, f"{prefix}{msg}", *args)
 
     def _init_db(self):
         """Initializes deduplication database for Files."""
@@ -114,6 +119,7 @@ class PlatformSyncService:
         
         # 1. Sync Learners
         learners = self._fetch_all(GET_LEARNERS_URL)
+        logger.info(f"Fetched {len(learners)} learners from platform.")
         for l in learners:
             l_id = l.get("id")
             profile = self._fetch_one(f"{LEARNER_PROFILE_URL}{l_id}")
@@ -123,6 +129,7 @@ class PlatformSyncService:
 
         # 2. Sync Mentors
         mentors = self._fetch_all(GET_MENTORS_URL)
+        logger.info(f"Fetched {len(mentors)} mentors from platform.")
         for m in mentors:
             m_id = m.get("id")
             profile = self._fetch_one(f"{MENTOR_PROFILE_URL}{m_id}")
@@ -130,19 +137,19 @@ class PlatformSyncService:
                 username = await self._upsert_user_data(profile, "mentor")
                 if username: seen_usernames.add(username)
         
-        # --- GLOBAL USER PURGE: Remove accounts no longer on the platform ---
+        # --- GLOBAL USER PURGE ---
         if seen_usernames:
             async with AsyncSessionLocal() as db:
-                # No exceptions: only users currently on the platform are kept
                 res = await db.execute(
                     select(User).where(User.username.not_in(list(seen_usernames)))
                 )
                 to_delete = res.scalars().all()
                 if to_delete:
-                    logger.info(f"Purging {len(to_delete)} stale/manual users from RAG.")
+                    logger.info(f"Purging {len(to_delete)} stale users.")
                     for u in to_delete:
                         await db.delete(u)
                     await db.commit()
+        logger.info("--- USER SYNC COMPLETE ---")
 
         logger.info("--- USER SYNC COMPLETE ---")
 
@@ -326,85 +333,122 @@ class PlatformSyncService:
 
     async def run_sync_cycle(self):
         """Main loop: Detects new users, files to ingest and stale files to purge."""
-        logger.info("--- STARTING SYNC & PURGE CYCLE ---")
-        if not self.access_token and not self.login():
-            logger.error("Authentication failed. Skipping cycle.")
+        self.current_cycle_id = uuid.uuid4().hex[:8]
+        lock_key = "lock:platform_sync_cycle"
+        
+        # AC-60: Distributed Lock to prevent overlapping runs
+        lock_acquired = await redis_client.set(lock_key, self.current_cycle_id, nx=True, ex=600)
+        
+        if not lock_acquired:
+            existing_cycle = await redis_client.get(lock_key)
+            logger.info(f"SYNC SKIP: Another cycle ({existing_cycle}) is already in progress. Exiting.")
             return
 
-        # 0. Build Master Batch Name Map (Friendly names for batches)
-        logger.info("Fetching Master Batch metadata...")
-        batches = self._fetch_all(GET_BATCHES_URL)
-        self.batch_name_map = {
-            b["batchId"]: b.get("courseName") or b.get("batchName") or f"Course {b['batchId']}" 
-            for b in batches if "batchId" in b
-        }
-        logger.info(f"Master Batch Map built with {len(self.batch_name_map)} entries.")
+        try:
+            self._log("--- STARTING SYNC & PURGE CYCLE ---")
+            if not self.access_token and not self.login():
+                self._log("Authentication failed. Skipping cycle.", logging.ERROR)
+                return
 
-        # 1. Sync Users and Enrollments
-        await self.sync_users_and_enrollments()
+            # 0. Build Master Batch Name Map (Friendly names for batches)
+            self._log("Fetching Master Batch metadata...")
+            batches = self._fetch_all(GET_BATCHES_URL)
+            self.batch_name_map = {
+                b["batchId"]: b.get("courseName") or b.get("batchName") or f"Course {b['batchId']}" 
+                for b in batches if "batchId" in b
+            }
+            self._log(f"Master Batch Map built with {len(self.batch_name_map)} entries.")
 
-        # --- GLOBAL BATCH PURGE: Remove batches no longer on the platform ---
-        valid_batch_ids = set(self.batch_name_map.keys())
-        if valid_batch_ids:
-            async with AsyncSessionLocal() as db:
-                res = await db.execute(select(Batch))
-                local_batches = res.scalars().all()
-                for batch in local_batches:
-                    if batch.id not in valid_batch_ids:
-                        logger.info(f"Purging dead batch: {batch.name} ({batch.id})")
-                        
-                        # A. Remove from Qdrant
-                        try:
-                            from qdrant_client.models import Filter, FieldCondition, MatchValue
-                            await qdrant.delete(
-                                collection_name="document_chunks",
-                                points_selector=Filter(must=[FieldCondition(key="batch_id", match=MatchValue(value=batch.id))])
-                            )
-                        except Exception as e: logger.error(f"Failed to purge Qdrant for batch {batch.id}: {e}")
+            # 1. Sync Users and Enrollments
+            await self.sync_users_and_enrollments()
 
-                        # B. Remove Physical Files
-                        import shutil
-                        batch_dir = os.path.join("backend", "uploads", batch.id)
-                        if os.path.exists(batch_dir):
+            # --- GLOBAL BATCH PURGE: Remove batches no longer on the platform ---
+            valid_batch_ids = set(self.batch_name_map.keys())
+            if valid_batch_ids:
+                async with AsyncSessionLocal() as db:
+                    res = await db.execute(select(Batch))
+                    local_batches = res.scalars().all()
+                    for batch in local_batches:
+                        if batch.id not in valid_batch_ids:
+                            self._log(f"Purging dead batch: {batch.name} ({batch.id})")
+                            
+                            # A. Remove from Qdrant
                             try:
-                                shutil.rmtree(batch_dir)
-                                logger.info(f"Deleted files for batch {batch.id}")
-                            except Exception as e: logger.error(f"Failed to delete files for {batch.id}: {e}")
+                                from qdrant_client.models import Filter, FieldCondition, MatchValue
+                                await qdrant.delete(
+                                    collection_name="document_chunks",
+                                    points_selector=Filter(must=[FieldCondition(key="batch_id", match=MatchValue(value=batch.id))])
+                                )
+                            except Exception as e: self._log(f"Failed to purge Qdrant for batch {batch.id}: {e}", logging.ERROR)
 
-                        # C. Remove from DB
-                        await db.delete(batch)
-                await db.commit()
+                            # B. Remove Physical Files
+                            import shutil
+                            batch_dir = os.path.join("backend", "uploads", batch.id)
+                            if os.path.exists(batch_dir):
+                                try:
+                                    shutil.rmtree(batch_dir)
+                                    self._log(f"Deleted files for batch {batch.id}")
+                                except Exception as e: self._log(f"Failed to delete files for {batch.id}: {e}", logging.ERROR)
 
-        # 2. Sync Files (Existing logic)
-        live_batches = self.get_live_batches()
-        for batch in live_batches:
-            batch_id = batch["batchId"]
-            current_platform_files = self.get_batch_files(batch_id)
-            platform_file_map = {f["id"]: f for f in current_platform_files if not f.get("isDeleted")}
-            platform_ids = set(platform_file_map.keys())
+                            # C. Remove from DB
+                            await db.delete(batch)
+                    await db.commit()
+
+            # 2. Sync Files (Existing logic)
+            self._log("--- SYNCING FILES ---")
+            live_batches = self.get_live_batches()
+            self._log(f"Found {len(live_batches)} 'live' batches for file sync.")
             
-            local_stored_ids = self.get_all_local_ids_for_batch(batch_id)
-            for file_id in local_stored_ids:
-                if file_id not in platform_ids:
-                    if self.trigger_deletion(file_id):
-                        self.remove_from_local_db(file_id)
+            for batch in live_batches:
+                batch_id = batch["batchId"]
+                batch_name = self.batch_name_map.get(batch_id, batch_id)
+                current_platform_files = self.get_batch_files(batch_id)
+                platform_file_map = {f["id"]: f for f in current_platform_files if not f.get("isDeleted")}
+                platform_ids = set(platform_file_map.keys())
+                
+                self._log(f"Batch {batch_name} ({batch_id}): {len(platform_ids)} active files on platform.")
+                
+                local_stored_ids = self.get_all_local_ids_for_batch(batch_id)
+                
+                # A. Deletion
+                for file_id in local_stored_ids:
+                    if file_id not in platform_ids:
+                        self._log(f"Detected deleted file {file_id} in batch {batch_id}. Triggering RAG purge...")
+                        if self.trigger_deletion(file_id):
+                            self.remove_from_local_db(file_id)
 
-            for file_id, f in platform_file_map.items():
-                if file_id not in local_stored_ids:
-                    file_name = f.get("fileName", "Unnamed Resource")
-                    if self.trigger_ingestion(f["fileUrl"], batch_id, file_name, file_id):
-                        self.mark_processed(file_id, f["fileUrl"], batch_id)
-        
-        logger.info("--- SYNC & PURGE CYCLE COMPLETE ---")
+                # B. Ingestion
+                for file_id, f in platform_file_map.items():
+                    if file_id not in local_stored_ids:
+                        file_name = f.get("fileName", "Unnamed Resource")
+                        self._log(f"Detected new file '{file_name}' ({file_id}) in batch {batch_id}. Triggering RAG ingestion...")
+                        if self.trigger_ingestion(f["fileUrl"], batch_id, file_name, file_id):
+                            self.mark_processed(file_id, f["fileUrl"], batch_id)
+            
+            self._log("--- SYNC & PURGE CYCLE COMPLETE ---")
+        finally:
+            # Release lock safely
+            try:
+                current_lock_val = await redis_client.get(lock_key)
+                if current_lock_val == self.current_cycle_id:
+                    await redis_client.delete(lock_key)
+            except:
+                pass
 
     async def start(self):
+        """Entry point for standalone execution (python backend/services/platform_sync.py)."""
         logger.info(f"Platform Sync Service (User + File) active (Interval: {POLL_INTERVAL}s)")
-        while True:
-            try:
-                await self.run_sync_cycle()
-            except Exception as e:
-                logger.error(f"CRITICAL: Sync loop crashed: {e}")
-            await asyncio.sleep(POLL_INTERVAL)
+        from infrastructure import init_infra, close_infra
+        await init_infra()
+        try:
+            while True:
+                try:
+                    await self.run_sync_cycle()
+                except Exception as e:
+                    logger.error(f"CRITICAL: Sync loop crashed: {e}")
+                await asyncio.sleep(POLL_INTERVAL)
+        finally:
+            await close_infra()
 
 if __name__ == "__main__":
     service = PlatformSyncService()

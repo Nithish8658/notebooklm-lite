@@ -182,8 +182,8 @@ export async function ingestBatchUrls(urls, batchId = "default_batch") {
 /* ======================
    METRICS
    ====================== */
-export async function fetchMetrics() {
-  const res = await fetch(`${BASE_URL}/metrics`);
+export async function fetchMetrics(range = '24h') {
+  const res = await fetch(`${BASE_URL}/metrics?range=${range}`);
   const data = await res.json();
   
   if (!res.ok) {
