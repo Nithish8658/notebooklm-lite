@@ -40,31 +40,14 @@ celery_app.conf.update(
         Queue("podcast", routing_key="podcast"),
     ),
     task_routes={
-        "sync_platform": {"queue": "platform_sync", "routing_key": "platform_sync"},
+        "sync_platform_task": {"queue": "platform_sync", "routing_key": "platform_sync"},
         "process_ingestion": {"queue": "ingestion", "routing_key": "ingestion"},
         "process_batch_ingestion": {"queue": "ingestion", "routing_key": "ingestion"},
         "generate_podcast_task": {"queue": "podcast", "routing_key": "podcast"},
     },
 )
 
-# Platform Sync is managed via a single scheduler thread inside the Celery worker.
-# This avoids requiring `celery beat`, and prevents duplicate schedules from multiple
-# uvicorn reload processes.
+# NOTE: Platform Sync is now managed by the Uvicorn Leader Election loop 
+# (see backend/main.py:start_distributed_coordinator) to ensure exactly-once 
+# dispatch across multiple workers.
 
-_SYNC_INTERVAL_SECONDS = 120
-
-@signals.worker_ready.connect
-def _start_platform_sync_scheduler(sender=None, **kwargs):
-    """Starts a background scheduler thread when the worker is ready."""
-    def _scheduler_loop():
-        # Run once immediately, then sleep between runs.
-        while True:
-            try:
-                celery_app.send_task("sync_platform")
-            except Exception as e:
-                # We don't want the thread to die; log and retry
-                print(f"WARNING: Failed to enqueue platform sync: {e}")
-            time.sleep(_SYNC_INTERVAL_SECONDS)
-
-    thread = threading.Thread(target=_scheduler_loop, daemon=True)
-    thread.start()

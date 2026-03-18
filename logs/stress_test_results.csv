@@ -1,0 +1,16 @@
+Timestamp,User_Name,Concurrency,Batch_ID,Status,Total_RTT,Retrieval_ms,LLM_ms,Key_Idx
+2026-03-17T13:02:55.710Z,nithish-learner,5,8a861151-5d27-4daf-bb1b-6cf9deeff22c,429,29,0,0,0
+2026-03-17T13:02:55.713Z,nithish-learner,5,8a861151-5d27-4daf-bb1b-6cf9deeff22c,429,29,0,0,4
+2026-03-17T13:02:55.722Z,harshini-learner,5,b33f8473-db92-494d-9216-0cde7e1854e5,403,39,0,0,3
+2026-03-17T13:02:55.729Z,abirami-learner,5,b33f8473-db92-494d-9216-0cde7e1854e5,200,46,0,0,1
+2026-03-17T13:03:11.259Z,abirami-learner,5,8a861151-5d27-4daf-bb1b-6cf9deeff22c,200,15575,7845.27,7568.35,2
+2026-03-17T13:03:13.307Z,abirami-learner,5,8a861151-5d27-4daf-bb1b-6cf9deeff22c,429,20,0,0,7
+2026-03-17T13:03:13.318Z,harshini-learner,5,b33f8473-db92-494d-9216-0cde7e1854e5,403,30,0,0,8
+2026-03-17T13:03:13.330Z,abirami-learner,5,b33f8473-db92-494d-9216-0cde7e1854e5,200,42,0,0,6
+2026-03-17T13:03:23.733Z,nithish-learner,5,8a861151-5d27-4daf-bb1b-6cf9deeff22c,200,10446,0,10289.83,5
+2026-03-17T13:03:26.406Z,nithish-learner,5,8a861151-5d27-4daf-bb1b-6cf9deeff22c,200,13117,0,12007.57,9
+2026-03-17T13:03:28.437Z,nithish-learner,5,8a861151-5d27-4daf-bb1b-6cf9deeff22c,429,13,0,0,0
+2026-03-17T13:05:28.443Z,abirami-learner,5,b33f8473-db92-494d-9216-0cde7e1854e5,ERR,120018,0,0,1
+2026-03-17T13:05:28.444Z,abirami-learner,5,8a861151-5d27-4daf-bb1b-6cf9deeff22c,ERR,120019,0,0,2
+2026-03-17T13:05:28.444Z,harshini-learner,5,b33f8473-db92-494d-9216-0cde7e1854e5,ERR,120019,0,0,3
+2026-03-17T13:05:28.445Z,nithish-learner,5,8a861151-5d27-4daf-bb1b-6cf9deeff22c,ERR,120019,0,0,4

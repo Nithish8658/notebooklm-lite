@@ -21,14 +21,31 @@ async def task_lifecycle(coro):
     finally:
         await close_infra()
 
-@celery_app.task(name="sync_platform", queue="platform_sync")
+@celery_app.task(name="sync_platform_task", queue="platform_sync")
 def sync_platform_task():
     """Background task for Platform Sync & Purge cycle.
-
-    This task is intended to be run on a schedule (e.g. via Celery beat).
+    Uses DistributedLock to ensure Exactly-Once execution.
     """
-    sync_service = PlatformSyncService()
-    asyncio.run(task_lifecycle(sync_service.run_sync_cycle()))
+    from infrastructure import DistributedLock
+    
+    async def run_sync_with_lock():
+        await init_infra()
+        # Execution Lock: 5 minute timeout
+        exec_lock = DistributedLock("active_platform_sync", timeout=300)
+        
+        try:
+            if await exec_lock.acquire():
+                print("CELERY: Acquired EXECUTION LOCK. Starting Sync...")
+                sync_service = PlatformSyncService()
+                await sync_service.run_sync_cycle()
+                print("CELERY: Sync Completed.")
+            else:
+                print("CELERY: Sync already in progress elsewhere. Skipping.")
+        finally:
+            await exec_lock.release()
+            await close_infra()
+
+    asyncio.run(run_sync_with_lock())
 
 @celery_app.task(name="process_ingestion", queue="ingestion")
 def process_ingestion_task(job_id: str, input_path: str, file_type: str, ingestion_id: str, file_id: str, filename: str, batch_id: str, mode: str = "single"):

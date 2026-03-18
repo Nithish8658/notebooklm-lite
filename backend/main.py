@@ -68,14 +68,18 @@ import redis.asyncio as redis
 
 # ===== ENV =====
 load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY_1")
 if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY not set")
+    raise RuntimeError("Neither GEMINI_API_KEY nor GEMINI_API_KEY_1 is set in the .env file.")
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 REDIS_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
 
 from infrastructure import init_infra, close_infra, redis_client, qdrant
+
+class BatchRepairingException(Exception):
+    def __init__(self, message: str):
+        self.message = message
 
 # --- COOLDOWN HELPERS ---
 async def set_cooldown(batch_id: str, topic: str, cache_type: str, duration: int = 180):
@@ -126,11 +130,42 @@ async def initialize_qdrant():
         except Exception as e:
             print(f"WARNING: Qdrant initialization failed for {coll}: {e}")
 
+# --- DISTRIBUTED COORDINATOR ---
+async def start_distributed_coordinator():
+    """
+    AC-100: Distributed Leader Election for Periodic Tasks.
+    Ensures 'Exactly-Once' task dispatch across multiple Uvicorn workers.
+    """
+    from infrastructure import DistributedLock
+    from celery_app import celery_app
+    
+    leader_lock = DistributedLock("platform_sync_leader", timeout=70)
+    print(f"COORDINATOR: Worker {os.getpid()} starting leader election loop.")
+    
+    while True:
+        try:
+            # 1. Attempt to become the Leader
+            if await leader_lock.acquire():
+                print(f"COORDINATOR: Worker {os.getpid()} ACQUIRED LEADERSHIP. Dispatching Sync...")
+                # 2. Only the Leader dispatches the task
+                celery_app.send_task("sync_platform_task")
+            else:
+                # 3. If we are already the leader, extend the lease
+                # (Optional optimization: if we hold it, we can extend it)
+                pass
+        except Exception as e:
+            print(f"COORDINATOR ERROR: {e}")
+            
+        await asyncio.sleep(60) # Check/Renew every minute
+
 # ===== LIFESPAN =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Initialize Process-Scoped Infrastructure
     await init_infra()
+    
+    # Start Distributed Coordinator (Background)
+    asyncio.create_task(start_distributed_coordinator())
     
     # Start the metadata eviction worker
     index_manager.start_evictor()
@@ -321,6 +356,13 @@ async def global_exception_handler(request: Request, exc: Exception):
     traceback.print_exc()
     return JSONResponse(status_code=500, content={"detail": "Internal Server Error."})
 
+@app.exception_handler(BatchRepairingException)
+async def batch_repairing_handler(request: Request, exc: BatchRepairingException):
+    return JSONResponse(
+        status_code=202,
+        content={"detail": exc.message, "status": "repairing"}
+    )
+
 # ===== STATE & JOBS =====
 # Stateless Architecture: No more global STATE. 
 # BM25 and Graph are stored in Postgres per batch.
@@ -436,8 +478,8 @@ async def create_flashcards(req: FlashcardRequest, db: AsyncSession = Depends(ge
 
 async def _create_flashcards_logic(req: FlashcardRequest, db: AsyncSession):
     await verify_user_enrollment(req.username, req.active_batch_id, db)
-    if not await ensure_batch_is_loaded(req.active_batch_id, db):
-        raise HTTPException(status_code=400, detail="No documents indexed.")
+    # This will raise BatchRepairingException if Qdrant is empty
+    await ensure_batch_is_loaded(req.active_batch_id, db)
 
     # --- SEMANTIC CACHE LOOKUP ---
     sorted_topics = sorted(req.topics) if req.topics else ["general"]
@@ -520,8 +562,8 @@ async def generate_quiz_endpoint(req: QuizGenerateRequest, db: AsyncSession = De
 
 async def _generate_quiz_logic(req: QuizGenerateRequest, db: AsyncSession):
     await verify_user_enrollment(req.username, req.active_batch_id, db)
-    if not await ensure_batch_is_loaded(req.active_batch_id, db):
-        raise HTTPException(status_code=400, detail="No documents indexed.")
+    # Autonomic repair trigger
+    await ensure_batch_is_loaded(req.active_batch_id, db)
 
     brain_handle = index_manager.acquire(req.active_batch_id)
     async with brain_handle as brain:
@@ -641,8 +683,8 @@ async def generate_podcast_endpoint(req: PodcastGenerateRequest, db: AsyncSessio
 
 async def _generate_podcast_logic(req: PodcastGenerateRequest, db: AsyncSession):
     await verify_user_enrollment(req.username, req.active_batch_id, db)
-    if not await ensure_batch_is_loaded(req.active_batch_id, db):
-        raise HTTPException(status_code=400, detail="No documents indexed.")
+    # Autonomic repair trigger
+    await ensure_batch_is_loaded(req.active_batch_id, db)
 
     # --- SEMANTIC CACHE LOOKUP ---
     topic_with_level = f"{req.topic} [Level: {req.complexity}]"
@@ -1060,8 +1102,23 @@ async def _ensure_batch_logic(batch_id: str, db: AsyncSession):
         points, _ = response
         
         if not points:
-            print(f"WARN: No data found in Qdrant for batch {batch_id}")
-            return False
+            print(f"WARN: No data found in Qdrant for batch {batch_id}. Triggering LAZY REPAIR (Deletion).")
+            # AC-100: Lazy Deletion Trigger
+            # Instead of firing a manual ingestion, we delete the local records.
+            # The next 2-min sync cycle will see these as 'new' and re-ingest correctly.
+            
+            async with db_semaphore:
+                # 1. Delete from Postgres
+                await db.execute(delete(Batch).where(Batch.id == batch_id))
+                await db.execute(delete(UserEnrollment).where(UserEnrollment.batch_id == batch_id))
+                await db.commit()
+            
+            # 2. Delete from SQLite Sync DB (Processed Files)
+            from services.platform_sync import PlatformSyncService
+            sync_service = PlatformSyncService()
+            sync_service.remove_all_files_for_batch(batch_id)
+            
+            raise BatchRepairingException("Preparing course materials for your session. Please try again in 60 seconds.")
 
         chunks = [p.payload for p in points]
         
@@ -1079,6 +1136,7 @@ async def _ensure_batch_logic(batch_id: str, db: AsyncSession):
         
         batch.bm25_data = bm25_dict
         batch.graph_data = new_graph
+        batch.integrity_status = "HEALTHY"
         await db.commit()
         
         print(f"SUCCESS: Built and persisted stateless metadata for batch {batch_id}.")
@@ -1113,6 +1171,7 @@ TUTOR_PROMPT = "Use a Socratic tutoring style. Give the answer directly. Ask gui
 class ChatResponse(BaseModel):
     reply: str
     citations: list[str] | None = None
+    debug_timings: dict | None = None
 class JobStatus(str, Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
@@ -1314,6 +1373,7 @@ async def process_ingestion_background(job_id: str, input_path: str, file_type: 
                 
                 batch.bm25_data = bm25_dict
                 batch.graph_data = new_graph
+                batch.integrity_status = "HEALTHY"
                 await db.commit()
                 
                 # IMS INVALIDATION: Clear RAM singleton so next request loads fresh data
@@ -1513,19 +1573,23 @@ async def switch_batch(req: SwitchBatchRequest, db: AsyncSession = Depends(get_d
     return {"status": "success", "active_batch_id": req.batch_id}
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
+async def chat(req: ChatRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """
     Unified Chat Endpoint.
     Uses Single-Flight to coalesce identical concurrent requests.
     """
+    custom_key = request.headers.get("X-Gemini-API-Key")
+    
     # Key for single-flight: batch + complexity + tutor + message
     flight_key = f"{req.active_batch_id}:{req.complexity}:{req.tutor_mode}:{req.message}"
 
-    return await single_flight.do(flight_key, _chat_logic, req, db)
+    return await single_flight.do(flight_key, _chat_logic, req, db, custom_key)
 
-async def _chat_logic(req: ChatRequest, db: AsyncSession):
+async def _chat_logic(req: ChatRequest, db: AsyncSession, custom_api_key: str = None):
     t_start = time.time()
     print(f"\n[INFERENCE] Starting Chat Inference for user {req.username}")
+    
+    timings = {}
 
     # AC-45: Rate Limit - Check for 3min cooldown
     await check_cooldown(req.active_batch_id, req.message, "chat")
@@ -1542,15 +1606,21 @@ async def _chat_logic(req: ChatRequest, db: AsyncSession):
 
     if cached_response:
         print(f"   -> [TIER 1 HIT] Inference Bypassed via Response Cache in {time.time() - t_start:.2f}s")
-        return ChatResponse(reply=cached_response["reply"], citations=cached_response.get("citations", []))
+        return ChatResponse(
+            reply=cached_response["reply"], 
+            citations=cached_response.get("citations", []),
+            debug_timings={"total_ms": round((time.time() - t_start) * 1000, 2), "cache_hit": True}
+        )
 
     # --- TIER 2: KNOWLEDGE CONTEXT CACHE (RETRIEVAL BYPASS) ---
     candidates = None
     cached_context = await get_semantic_cache(req.active_batch_id, req.message, "chat_context")
 
+    t_retrieval_start = time.time()
     if cached_context:
         print(f"   -> [TIER 2 HIT] Retrieval Bypassed via Context Cache")
         candidates = cached_context
+        timings["retrieval_ms"] = 0
     else:
         # 2. Fetch Metadata (IMS RAM Lifecycle Lease)
         brain_handle = index_manager.acquire(req.active_batch_id)
@@ -1563,7 +1633,11 @@ async def _chat_logic(req: ChatRequest, db: AsyncSession):
 
             # 3. Full Retrieval Pipeline
             print(f"[INFERENCE PHASE 2/4] Query Rewriting")
-            rewrite_result = await rewrite_query_ensemble(query=req.message, call_llm_fn=call_gemini_async)
+            # Wrap LLM call to pass the custom key
+            rewrite_result = await rewrite_query_ensemble(
+                query=req.message, 
+                call_llm_fn=lambda p: call_gemini_async(p, custom_api_key=custom_api_key)
+            )
 
             print(f"[INFERENCE PHASE 3/4] Retrieval & Reranking")
             candidates = await retrieve_candidates(
@@ -1581,6 +1655,8 @@ async def _chat_logic(req: ChatRequest, db: AsyncSession):
             if candidates:
                 # Save to Context Cache (Background) - Available for ANY complexity level
                 asyncio.create_task(set_semantic_cache(req.active_batch_id, req.message, "chat_context", candidates))
+    
+    timings["retrieval_ms"] = round((time.time() - t_retrieval_start) * 1000, 2)
 
     if not candidates: 
         return ChatResponse(reply="Currently we do not have the answer for this question.", citations=[])
@@ -1603,7 +1679,9 @@ Context:
 Question: {req.message}
 """.strip()
 
-    reply = await call_gemini_async(final_prompt)
+    t_llm_start = time.time()
+    reply = await call_gemini_async(final_prompt, custom_api_key=custom_api_key)
+    timings["llm_ms"] = round((time.time() - t_llm_start) * 1000, 2)
 
     # Extract citations
     doc_ids = list(set([c['doc_id'] for c in candidates]))
@@ -1622,5 +1700,6 @@ Question: {req.message}
     else:
         await set_cooldown(req.active_batch_id, req.message, "chat")
 
+    timings["total_ms"] = round((time.time() - t_start) * 1000, 2)
     print(f"SUCCESS: Total Inference Time: {time.time() - t_start:.2f}s\n")
-    return ChatResponse(reply=reply, citations=found_citations)
+    return ChatResponse(reply=reply, citations=found_citations, debug_timings=timings)

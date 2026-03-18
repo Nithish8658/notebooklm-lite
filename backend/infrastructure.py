@@ -125,6 +125,44 @@ class InfrastructureProxy:
     def __getattr__(self, name):
         return getattr(self._get_target(), name)
 
+class DistributedLock:
+    """
+    AC-100: Distributed Mutex using Redis Atomic SET NX EX.
+    Ensures 'Exactly-Once' execution across distributed workers.
+    """
+    def __init__(self, name: str, timeout: int = 60):
+        self.name = f"lock:{name}"
+        self.timeout = timeout
+        self._holder_id = os.getenv("HOSTNAME", "worker") + "_" + str(os.getpid())
+
+    async def acquire(self) -> bool:
+        """Attempts to acquire the lock. Returns True if successful."""
+        res = await redis_client.set(self.name, self._holder_id, nx=True, ex=self.timeout)
+        return res is True
+
+    async def release(self):
+        """Releases the lock only if we are the holder (prevents accidental release)."""
+        # Sophisticated release using Lua script to ensure atomicity
+        script = """
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+        else
+            return 0
+        end
+        """
+        await redis_client.eval(script, 1, self.name, self._holder_id)
+
+    async def extend(self, additional_time: int):
+        """Extends the lease if we still hold the lock."""
+        script = """
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("expire", KEYS[1], ARGV[2])
+        else
+            return 0
+        end
+        """
+        await redis_client.eval(script, 1, self.name, self._holder_id, additional_time)
+
 # Exported singletons that act as proxies to the loop-scoped clients
 redis_client = InfrastructureProxy("redis_client")
 qdrant = InfrastructureProxy("qdrant_client")

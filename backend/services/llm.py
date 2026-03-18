@@ -10,120 +10,71 @@ from functools import lru_cache
 # ===== ENV =====
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY not set")
+# Load all 10 keys into a pool
+API_KEY_POOL = []
+for i in range(1, 11):
+    key = os.getenv(f"GEMINI_API_KEY_{i}")
+    if key:
+        API_KEY_POOL.append(key)
 
-# Create client explicitly
-client = genai.Client(api_key=GEMINI_API_KEY)
+# Fallback to single key if pool is empty
+if not API_KEY_POOL:
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    if GEMINI_API_KEY:
+        API_KEY_POOL.append(GEMINI_API_KEY)
+
+if not API_KEY_POOL:
+    raise RuntimeError("No Gemini API keys found in .env (Expected GEMINI_API_KEY_1 to _10)")
+
+print(f"LLM: Initialized Round-Robin pool with {len(API_KEY_POOL)} keys.")
+
+# Global counter for rotation
+_key_counter = 0
+
+def get_next_api_key() -> str:
+    global _key_counter
+    key = API_KEY_POOL[_key_counter % len(API_KEY_POOL)]
+    _key_counter += 1
+    return key
+
+# Create a default client (using the first key)
+client = genai.Client(api_key=API_KEY_POOL[0])
 
 # Use the stable model name
-MODEL_ID = "gemini-3.1-flash-lite-preview"  # Standard stable model for 2026
+MODEL_ID = "gemini-3.1-flash-lite-preview"
 
-# Create shared clients
-client = genai.Client(api_key=GEMINI_API_KEY)
-
-@lru_cache(maxsize=128)
-def _call_gemini_cached(prompt: str) -> str:
-    """Internal cached version of the call."""
-    response = client.models.generate_content(
-        model=MODEL_ID, 
-        contents=prompt,
-        config={"automatic_function_calling": {"disable": True}}
-    )
-    
-    # Log token usage if available
-    usage = getattr(response, 'usage_metadata', None)
-    if usage:
-        log_metric({
-            "category": "llm",
-            "operation": "generate_content",
-            "model_name": MODEL_ID,
-            "duration_ms": 0,
-            "metadata": {
-                "prompt_tokens": usage.prompt_token_count,
-                "candidates_tokens": usage.candidates_token_count,
-                "total_tokens": usage.total_token_count,
-                "cached": False
-            }
-        })
-    
-    return response.text
-
-def call_gemini(prompt: str, use_cache: bool = True) -> str:
-    """Synchronous version for backward compatibility."""
-    try:
-        if use_cache:
-            return _call_gemini_cached(prompt)
-        
-        # Non-cached path
-        response = client.models.generate_content(
-            model=MODEL_ID, 
-            contents=prompt,
-            config={"automatic_function_calling": {"disable": True}}
-        )
-        return response.text
-    except errors.APIError as e:
-        # Log the exact native error from Gemini API
-        log_metric({
-            "category": "llm",
-            "operation": "generate_content_error",
-            "model_name": MODEL_ID,
-            "metadata": {
-                "error_type": "APIError",
-                "status_code": getattr(e, "code", None),
-                "message": str(e)
-            }
-        })
-        
-        # Raise HTTPException with native status code
-        raise HTTPException(
-            status_code=getattr(e, "code", 502),
-            detail=f"Gemini API Error: {str(e)}"
-        )
-    except Exception as e:
-        # Fallback for other errors (network, etc.)
-        log_metric({
-            "category": "llm",
-            "operation": "generate_content_error",
-            "model_name": MODEL_ID,
-            "metadata": {
-                "error_type": type(e).__name__,
-                "message": str(e)
-            }
-        })
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unexpected Gemini Error: {str(e)}"
-        )
-async def call_gemini_async(prompt: str) -> str:
+async def call_gemini_async(prompt: str, custom_api_key: str = None) -> str:
     """
-    AC-10: Async non-cached Gemini call for concurrent usage.
-    Reuses a single client connection for performance.
+    AC-10: Async Gemini call with Global Round-Robin distribution.
     """
     t_call_start = time.time()
+    
+    # Selection: Custom Key > Round-Robin Pool
+    selected_key = custom_api_key or get_next_api_key()
+    target_client = genai.Client(api_key=selected_key)
+        
     try:
-        # Re-using the aio client from the global client instance
-        response = await client.aio.models.generate_content(
+        response = await target_client.aio.models.generate_content(
             model=MODEL_ID,
             contents=prompt,
             config={"automatic_function_calling": {"disable": True}}
         )
         t_call_end = time.time()
+        duration_ms = round((t_call_end - t_call_start) * 1000, 2)
 
-        # Log token usage if available
+        # Log usage
         usage = getattr(response, 'usage_metadata', None)
         if usage:
-            print(f"      - Gemini usage: Prompt {usage.prompt_token_count} tokens, Candidates {usage.candidates_token_count} tokens (Total: {usage.total_token_count})")
             log_metric({
                 "category": "llm",
                 "operation": "generate_content",
                 "model_name": MODEL_ID,
-                "duration_ms": round((t_call_end - t_call_start) * 1000, 2),
+                "duration_ms": duration_ms,
                 "metadata": {
                     "prompt_tokens": usage.prompt_token_count,
                     "candidates_tokens": usage.candidates_token_count,
-                    "total_tokens": usage.total_token_count
+                    "total_tokens": usage.total_token_count,
+                    "key_used": selected_key[:10] + "..." 
                 }
             })
 

@@ -331,6 +331,13 @@ class PlatformSyncService:
             conn.execute("DELETE FROM processed_files WHERE file_id = ?", (file_id,))
             conn.commit()
 
+    def remove_all_files_for_batch(self, batch_id):
+        """Purges all file tracking for a batch to force re-ingestion."""
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM processed_files WHERE batch_id = ?", (batch_id,))
+            conn.commit()
+        self._log(f"SQLite: Purged tracking for batch {batch_id}")
+
     async def run_sync_cycle(self):
         """Main loop: Detects new users, files to ingest and stale files to purge."""
         self.current_cycle_id = uuid.uuid4().hex[:8]
