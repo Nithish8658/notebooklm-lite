@@ -1,11 +1,14 @@
 import os
 import asyncio
 import time
+import json
+import multiprocessing
 import torch
 import numpy as np
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from transformers import AutoTokenizer
+import onnxruntime as ort
 from optimum.onnxruntime import ORTModelForFeatureExtraction
 import logging
 
@@ -18,16 +21,27 @@ _embedding_model = None
 
 # ---------- ONNX MODEL WRAPPER ----------
 class OnnxEmbeddingModel:
-    def __init__(self, model_id: str):
+    def __init__(self, model_id: str, *, num_threads: int | None = None):
         # Path: backend/services/embeddings.py -> backend/models/bge-onnx
         self.project_root = Path(__file__).resolve().parent.parent 
         onnx_path = self.project_root / "models" / "bge-onnx"
         
-        # AC-52: Smart path resolution for Xenova/Optimum structure
+        # 1. AC-52: Dynamic Config Detection (Architectural Improvement)
+        config_path = onnx_path / "config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"Missing config.json in {onnx_path}")
+            
+        with open(config_path, "r") as f:
+            self.config_data = json.load(f)
+        
+        # Expose dimensions for infrastructure synchronization
+        self.hidden_size = self.config_data.get("hidden_size", 768)
+        _LOG.info("Detected model dimensions: %d", self.hidden_size)
+
+        # 2. Optimized File Selection (INT8 First)
         model_filename = "model_quantized.onnx"
         subfolder = None
         
-        # Check for quantized version first
         if (onnx_path / "onnx" / "model_quantized.onnx").exists():
             subfolder = "onnx"
         elif (onnx_path / "model_quantized.onnx").exists():
@@ -40,20 +54,48 @@ class OnnxEmbeddingModel:
             elif (onnx_path / "model.onnx").exists():
                 subfolder = None
             else:
-                # CRITICAL: If no ONNX file is found, we must not let it fall back to HF Hub
-                raise FileNotFoundError(f"No ONNX model found in {onnx_path}. Ensure the main process has finished downloading models.")
+                raise FileNotFoundError(f"No valid ONNX model found in {onnx_path}. Run setup_optimized_model.py first.")
 
-        _LOG.info("Loading optimized ONNX embedding model (File: %s, Subfolder: %s) from %s", 
+        _LOG.info("Loading INT8 optimized ONNX embedding model (File: %s, Subfolder: %s) from %s", 
                  model_filename, subfolder or "root", onnx_path)
+
+        if num_threads is None:
+            env_threads = os.getenv("EMBEDDING_THREADS")
+            if env_threads:
+                num_threads = int(env_threads)
+            else:
+                total_cores = multiprocessing.cpu_count()
+                num_threads = min(4, max(1, total_cores // 2))
+        else:
+            total_cores = multiprocessing.cpu_count()
+            num_threads = max(1, min(int(num_threads), total_cores))
+
+        _LOG.info("CPU Optimization: Using %d threads for embedding inference.", num_threads)
+
+        sess_options = ort.SessionOptions()
+        sess_options.intra_op_num_threads = num_threads
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         
-        # Standardize loading: always load from verified local directory
-        # Use .as_posix() to ensure Windows paths are handled correctly by HF libraries
-        self.tokenizer = AutoTokenizer.from_pretrained(onnx_path.as_posix(), local_files_only=True)
+        # 3. AC-52: Production-Grade Optimizations
+        # Enable Memory Mapping (mmap) for Zero-Copy Sharing across workers
+        sess_options.add_session_config_entry("session.use_mmap", "1")
+        # Optimization for INT8 Quantized models: Prefer sequential execution
+        sess_options.add_session_config_entry("session.inter_op_num_threads", "1")
+        
+        # Use .as_posix() to ensure Windows paths are handled correctly
+        # Use use_fast=True for high-speed Rust-based tokenization
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            onnx_path.as_posix(), 
+            local_files_only=True,
+            use_fast=True
+        )
         self.model = ORTModelForFeatureExtraction.from_pretrained(
             onnx_path.as_posix(), 
             file_name=model_filename,
             subfolder=subfolder,
-            provider="CPUExecutionProvider", 
+            provider="CPUExecutionProvider",
+            session_options=sess_options,
             local_files_only=True
         )
     
@@ -73,7 +115,8 @@ class OnnxEmbeddingModel:
         all_embeddings = []
         for i in range(0, len(sentences), batch_size):
             batch = sentences[i : i + batch_size]
-            encoded_input = self.tokenizer(batch, padding=True, truncation=True, max_length=384, return_tensors='pt')
+            # AC-52: Context capacity increased to 512 for Small-INT8
+            encoded_input = self.tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors='pt')
             with torch.no_grad():
                 model_output = self.model(**encoded_input)
             sentence_embeddings = self._mean_pooling(model_output, encoded_input['attention_mask'])
@@ -86,10 +129,10 @@ class OnnxEmbeddingModel:
         result = np.concatenate(all_embeddings, axis=0)
         return result[0] if is_single else result
 
-def load_embedding_model():
+def load_embedding_model(*, num_threads: int | None = None):
     global _embedding_model
     if _embedding_model is None:
-        _embedding_model = OnnxEmbeddingModel(EMBEDDING_MODEL_NAME)
+        _embedding_model = OnnxEmbeddingModel(EMBEDDING_MODEL_NAME, num_threads=num_threads)
     return _embedding_model
 
 def get_embedding_model():
@@ -106,101 +149,27 @@ def compute_cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
 # ---------- BATCH MANAGER ----------
 class BatchEmbeddingManager:
     """
-    AC-22: Smart Batching for Embeddings (Thread/Loop Safe version).
-    Uses Loop-Local Storage to prevent 'different event loop' crashes 
-    when running concurrent Celery tasks.
+    Compatibility wrapper for the dedicated embedding runtime.
     """
     def __init__(self, model_getter, batch_size: int = 16, wait_time_ms: int = 10):
         self.model_getter = model_getter
         self.batch_size = batch_size
         self.wait_time_ms = wait_time_ms / 1000.0
-        
-        # INDUSTRIAL FIX: State is stored per-loop to avoid cross-contamination
-        # Dictionary of {loop_id: {"queue": Queue, "task": Task}}
-        self._loop_states = {}
-        self._lock = asyncio.Lock()
 
-    def _get_loop_state(self):
-        """Returns the queue and background task for the current loop."""
-        loop = asyncio.get_running_loop()
-        loop_id = id(loop)
-        
-        if loop_id not in self._loop_states:
-            _LOG.info("Initializing unique Embedding Batcher for Loop: %s", loop_id)
-            queue = asyncio.Queue()
-            task = loop.create_task(self._batch_loop(queue))
-            self._loop_states[loop_id] = {"queue": queue, "task": task}
-            
-        # Cleanup: Remove dead loops from registry to prevent memory leak
-        # (Simplified: in production we would use a WeakKeyDictionary)
-        
-        return self._loop_states[loop_id]
+    async def get_embedding(self, text: str, *, request_context=None, priority: str = "online") -> List[float]:
+        from services.embedding_runtime import get_embedding_runtime
 
-    async def get_embedding(self, text: str) -> List[float]:
-        """
-        Public API to request an embedding. 
-        Isolated per event loop for maximum stability.
-        """
-        state = self._get_loop_state()
-        
-        # Ensure the background task is still alive
-        if state["task"].done():
-            _LOG.info("Restarting dead background task for loop.")
-            state["task"] = asyncio.get_running_loop().create_task(self._batch_loop(state["queue"]))
+        return await get_embedding_runtime().get_embedding(
+            text,
+            request_context=request_context,
+            priority=priority,
+        )
 
-        future = asyncio.get_running_loop().create_future()
-        await state["queue"].put((text, future))
-        return await future
+    async def get_embeddings(self, texts: List[str], *, request_context=None, priority: str = "online") -> List[List[float]]:
+        from services.embedding_runtime import get_embedding_runtime
 
-    async def _batch_loop(self, queue: asyncio.Queue):
-        _LOG.info("Embedding Batch Loop Started.")
-        while True:
-            try:
-                text, future = await queue.get()
-                batch = [(text, future)]
-
-                start_wait = time.time()
-                while len(batch) < self.batch_size and (time.time() - start_wait) < self.wait_time_ms:
-                    try:
-                        text, future = queue.get_nowait()
-                        batch.append((text, future))
-                    except asyncio.QueueEmpty:
-                        break
-                
-                try:
-                    texts = [item[0] for item in batch]
-                    futures = [item[1] for item in batch]
-                    
-                    t_start = time.perf_counter()
-                    model = self.model_getter()
-                    
-                    # Offload model inference to a thread to keep the loop responsive
-                    embeddings = await asyncio.to_thread(
-                        model.encode,
-                        texts,
-                        is_query=True
-                    )
-                    
-                    if len(texts) == 1 and embeddings.ndim == 1:
-                        embeddings = np.expand_dims(embeddings, axis=0)
-
-                    duration = time.perf_counter() - t_start
-                    if len(batch) > 1:
-                        _LOG.info("BATCH ENCODE: Processed %d texts in %.4fs (%.4fs per text)", 
-                                len(batch), duration, duration/len(batch))
-
-                    for i, emb in enumerate(embeddings):
-                        if not futures[i].done():
-                            futures[i].set_result(emb.tolist())
-
-                except Exception as e:
-                    _LOG.error("BATCH ENCODE ERROR: %s", e)
-                    for _, fut in batch:
-                        if not fut.done():
-                            fut.set_exception(e)
-                finally:
-                    for _ in range(len(batch)): 
-                        queue.task_done()
-            except Exception as loop_err:
-                _LOG.critical("BATCH LOOP FATAL ERROR: %s", loop_err)
-                await asyncio.sleep(1) # Prevent tight loop on crash
+        return await get_embedding_runtime().get_embeddings(
+            texts,
+            request_context=request_context,
+            priority=priority,
+        )

@@ -3,11 +3,28 @@ import ReactMarkdown from "react-markdown";
 import { sendMessage } from "../api";
 import { useGlobalState } from "../GlobalState";
 
+function getMessageText(message) {
+  if (typeof message?.text === "string") {
+    return message.text;
+  }
+  if (typeof message?.reply === "string") {
+    return message.reply;
+  }
+  if (typeof message?.content === "string") {
+    return message.content;
+  }
+  if (message?.text == null && message?.reply == null && message?.content == null) {
+    return "";
+  }
+  return String(message?.text ?? message?.reply ?? message?.content ?? "");
+}
+
 function Chat() {
   const { user, messages, setMessages, chatInput: input, setChatInput: setInput } = useGlobalState();
   const [loading, setLoading] = useState(false);
   const [complexity, setComplexity] = useState("Undergrad");
   const [tutorMode, setTutorMode] = useState(false);
+  const [bypassRag, setBypassRag] = useState(false);
   const messagesEndRef = useRef(null);
 
   const complexityLevels = ["5-Year-Old", "High School", "Undergrad", "PhD Expert"];
@@ -33,7 +50,14 @@ function Chat() {
     setLoading(true);
 
     try {
-      const reply = await sendMessage(user.username, user.active_batch_id, userMessage, complexity, tutorMode);
+      const reply = await sendMessage(
+        user.username, 
+        user.active_batch_id, 
+        userMessage, 
+        complexity, 
+        tutorMode,
+        bypassRag
+      );
       setMessages(prev => [...prev, { role: "bot", text: reply }]);
     } catch (err) {
       setMessages(prev => [
@@ -51,6 +75,29 @@ function Chat() {
         <h2>NotebookLM Lite</h2>
         
         <div style={{ display: 'flex', gap: '15px', alignItems: 'center' }}>
+          {/* Direct LLM Toggle */}
+          <button
+            onClick={() => setBypassRag(!bypassRag)}
+            style={{
+              padding: '8px 16px',
+              borderRadius: '20px',
+              border: bypassRag ? '2px solid #6f42c1' : '1px solid #ccc',
+              background: bypassRag ? '#f3f0ff' : '#fff',
+              color: bypassRag ? '#6f42c1' : '#666',
+              fontSize: '0.8rem',
+              fontWeight: '700',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              transition: 'all 0.3s',
+              boxShadow: bypassRag ? '0 0 15px rgba(111, 66, 193, 0.3)' : 'none'
+            }}
+          >
+            <span style={{ fontSize: '1.1rem' }}>⚡</span> 
+            <span>DIRECT LLM</span>
+          </button>
+
           {/* Advanced Tutor Mode Toggle */}
           <div style={{ position: 'relative' }}>
             <button
@@ -123,15 +170,16 @@ function Chat() {
       <div className="messages-list">
         {messages.map((m, i) => {
           // Extract suggested questions if they exist
-          let displayText = m.text;
+          const safeText = getMessageText(m);
+          let displayText = safeText;
           let suggestedQuestions = [];
           
           if (m.role === 'bot') {
             const sqRegex = /<sq>(.*?)<\/sq>/g;
-            const matches = [...m.text.matchAll(sqRegex)];
+            const matches = [...safeText.matchAll(sqRegex)];
             suggestedQuestions = matches.map(match => match[1]);
             // Remove tags from the text shown in the markdown
-            displayText = m.text.replace(sqRegex, '').trim();
+            displayText = safeText.replace(sqRegex, '').trim();
           }
 
           return (
@@ -185,7 +233,7 @@ function Chat() {
                       )}
                     </>
                   ) : (
-                    displayText
+                    displayText || ""
                   )}
                 </div>
               </div>

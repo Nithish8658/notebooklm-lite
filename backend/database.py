@@ -38,12 +38,13 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 class Batch(Base):
-# ... (rest of the models remain same until init_db)
     __tablename__ = "batches"
     id = Column(String, primary_key=True, index=True) # e.g. "CS101"
     name = Column(String, nullable=False) # e.g. "Computer Science 101"
     graph_data = Column(JSON, nullable=True) # Persisted Knowledge Graph
     bm25_data = Column(JSON, nullable=True)  # Persisted BM25 Statistics (IDF, etc.)
+    integrity_status = Column(String, nullable=False, default="HEALTHY") # HEALTHY, REPAIR_REQUIRED, REPAIRING
+    last_repair_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 class UserEnrollment(Base):
@@ -107,6 +108,8 @@ def init_db():
         try:
             conn.execute(text("ALTER TABLE batches ADD COLUMN IF NOT EXISTS graph_data JSON;"))
             conn.execute(text("ALTER TABLE batches ADD COLUMN IF NOT EXISTS bm25_data JSON;"))
+            conn.execute(text("ALTER TABLE batches ADD COLUMN IF NOT EXISTS integrity_status VARCHAR DEFAULT 'HEALTHY';"))
+            conn.execute(text("ALTER TABLE batches ADD COLUMN IF NOT EXISTS last_repair_at TIMESTAMP;"))
             conn.execute(text("ALTER TABLE podcasts ADD COLUMN IF NOT EXISTS topic VARCHAR;"))
             
             # Add complexity column to Studio tables

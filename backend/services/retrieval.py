@@ -1,15 +1,97 @@
 import time
 import uuid
 import asyncio
-from typing import Dict, List, Optional, Callable, Awaitable
+from typing import Dict, List, Optional, Callable, Awaitable, Tuple
 from retrieval.bm25_index import BM25ChunkIndex
 from retrieval.hybrid_retriever import hybrid_retrieve, normalize
 from graph.traversal import multi_hop_expand
-from rerank import rerank_with_cross_encoder
+from services.phase2_runtime import get_phase2_runtime
 from metrics import log_metric
 import logging
 
 _LOG = logging.getLogger("retrieval_service")
+
+
+def _assess_graph_expansion(
+    hybrid_scores: Dict[str, float],
+    dense_scores: Dict[str, float],
+    sparse_scores: Dict[str, float],
+) -> Tuple[bool, str]:
+    runtime = get_phase2_runtime()
+    ranked_items = list(hybrid_scores.items())
+
+    if not ranked_items:
+        return True, "no_hybrid_candidates"
+
+    top_window_size = runtime.config.graph_skip_candidate_count
+    if len(ranked_items) < top_window_size:
+        return True, f"candidate_count={len(ranked_items)}<{top_window_size}"
+
+    top_window = ranked_items[:top_window_size]
+    top_id, top_score = top_window[0]
+    second_score = top_window[1][1] if len(top_window) > 1 else 0.0
+    top_gap = top_score - second_score
+    consensus_count = sum(1 for cid, _ in top_window if cid in dense_scores and cid in sparse_scores)
+    top_in_both = top_id in dense_scores and top_id in sparse_scores
+
+    if top_in_both and consensus_count >= runtime.config.graph_skip_min_consensus_count and top_gap >= runtime.config.graph_skip_min_top_gap:
+        return (
+            False,
+            (
+                "strong_direct_retrieval "
+                f"(top_gap={top_gap:.4f}, consensus={consensus_count}/{top_window_size}, "
+                f"top_in_dense_and_sparse={top_in_both})"
+            ),
+        )
+
+    return (
+        True,
+        (
+            "insufficient_direct_confidence "
+            f"(top_gap={top_gap:.4f}, consensus={consensus_count}/{top_window_size}, "
+            f"top_in_dense_and_sparse={top_in_both})"
+        ),
+    )
+
+
+def _select_diverse_candidates(candidates: List[dict], max_total: int) -> List[dict]:
+    runtime = get_phase2_runtime()
+    per_document = runtime.config.candidate_max_per_document
+    per_section = runtime.config.candidate_max_per_section
+
+    document_counts: Dict[str, int] = {}
+    section_counts: Dict[tuple[str, str], int] = {}
+    selected: List[dict] = []
+
+    for candidate in sorted(candidates, key=lambda item: (-item.get("score", 0.0), item.get("doc_id", ""))):
+        metadata = candidate.get("metadata", {})
+        document_id = str(metadata.get("document_id") or candidate.get("doc_id") or "unknown")
+        section_key = str(metadata.get("section_title") or "")
+        scoped_section = (document_id, section_key)
+
+        if document_counts.get(document_id, 0) >= per_document:
+            continue
+        if section_key and section_counts.get(scoped_section, 0) >= per_section:
+            continue
+
+        document_counts[document_id] = document_counts.get(document_id, 0) + 1
+        if section_key:
+            section_counts[scoped_section] = section_counts.get(scoped_section, 0) + 1
+        selected.append(candidate)
+
+        if len(selected) >= max_total:
+            break
+
+    if len(selected) < len(candidates):
+        _LOG.info(
+            "Candidate diversity pruned %d -> %d using per-document=%d per-section=%d",
+            len(candidates),
+            len(selected),
+            per_document,
+            per_section,
+        )
+
+    return selected
 
 async def retrieve_candidates(
     *,
@@ -37,6 +119,7 @@ async def retrieve_candidates(
     # Generate a request ID for correlation if not provided
     req_id = correlation_id or str(uuid.uuid4())
     t_start = t_inference_start or time.time()
+    runtime = get_phase2_runtime()
 
     if not rewrites:
         rewrites = [{"query": query, "type": "original", "weight": 1.0}]
@@ -75,7 +158,8 @@ async def retrieve_candidates(
         
         # ---- Sparse (Sync In-Memory per Request) ----
         # CPU-Bound: Offload to thread
-        sparse_scores = await asyncio.to_thread(
+        sparse_scores = await runtime.run_cpu_stage(
+            "bm25_search",
             bm25.search, q, batch_id=batch_id, top_k=sparse_top_k
         ) if bm25 else {}
 
@@ -136,10 +220,6 @@ async def retrieve_candidates(
     if not agg_dense and not agg_sparse:
         return []
 
-    # ---------- NORMALIZE AGGREGATIONS ----------
-    agg_dense = normalize(agg_dense)
-    agg_sparse = normalize(agg_sparse)
-
     # ---------- HYBRID FUSION ----------
     hybrid_scores = hybrid_retrieve(
         dense_scores=agg_dense,
@@ -154,29 +234,37 @@ async def retrieve_candidates(
         return []
 
     # ---------- GRAPH EXPANSION ----------
-    # In stateless mode, multi_hop_expand needs a way to check batch_id.
-    # However, since we'll fetch full chunks later, we can temporarily assume the graph 
-    # itself was built per-batch or check after materialization.
-    # To keep it truly secure, we'll fetch all candidate metadata from Qdrant.
-    
-    # CPU-Bound: Offload to thread
-    expanded = await asyncio.to_thread(
-        multi_hop_expand,
-        seed_scores=hybrid_scores,
-        graph=graph,
-        chunk_lookup={}, # We don't have lookup in memory anymore
-        batch_id=batch_id,
-        max_hops=2,
-        max_total=60,
-        use_cache_only=True # Tell traversal to not rely on lookup for filtering if unavailable
+    # Only pay the graph-expansion cost when first-pass hybrid retrieval is not already strong.
+    should_expand_graph, graph_reason = _assess_graph_expansion(
+        hybrid_scores,
+        agg_dense,
+        agg_sparse,
     )
-    
-    for cid in expanded:
-        if cid not in origins_map: origins_map[cid] = set()
-        origins_map[cid].add("graph")
-
-    t_graph = time.time()
-    print(f"      -> Graph Expansion: Expanded to {len(expanded)} candidates in {(t_graph - t_fusion)*1000:.2f}ms (Total: {t_graph - t_start:.2f}s)")
+    if should_expand_graph:
+        expanded = await runtime.run_cpu_stage(
+            "graph_expand",
+            multi_hop_expand,
+            seed_scores=hybrid_scores,
+            graph=graph,
+            chunk_lookup={},
+            batch_id=batch_id,
+            max_hops=runtime.config.graph_expand_max_hops,
+            max_total=runtime.config.graph_expand_max_total,
+            use_cache_only=True,
+        )
+        for cid in expanded:
+            if cid not in origins_map:
+                origins_map[cid] = set()
+            origins_map[cid].add("graph")
+        t_graph = time.time()
+        print(
+            f"      -> Graph Expansion: Expanded to {len(expanded)} candidates in {(t_graph - t_fusion)*1000:.2f}ms "
+            f"(Total: {t_graph - t_start:.2f}s, reason={graph_reason})"
+        )
+    else:
+        expanded = hybrid_scores
+        t_graph = time.time()
+        print(f"      -> Graph Expansion Skipped: {graph_reason} ({t_graph - t_start:.2f}s total)")
 
     # ---------- NORMALIZE + FILTER ----------
     if not expanded:
@@ -210,12 +298,14 @@ async def retrieve_candidates(
             "doc_id": cid,
             "text": chunk["text"],
             "metadata": {
-                "section_title": chunk.get("section_title"),
+                "document_id": chunk.get("document_id"),
+                "section_title": chunk.get("section_title") or chunk.get("metadata", {}).get("sheet_name"),
                 "pages": chunk.get("pages"),
                 "origins": list(origins_map.get(cid, ["unknown"]))
             },
             "score": expanded[cid],
         })
+    candidates = _select_diverse_candidates(candidates, max_candidates)
     t_materialize = time.time()
     print(f"      -> Materialization Completed in {t_materialize - t_graph:.2f}s (Total: {t_materialize - t_start:.2f}s)")
 
@@ -231,13 +321,11 @@ async def retrieve_candidates(
             best_semantic = [top_q]
 
     t4 = time.time()
-    # Offload CPU-bound reranking to a thread to keep the event loop free
-    results = await asyncio.to_thread(
-        rerank_with_cross_encoder,
+    results = await runtime.rerank(
         query=query,
         candidates=candidates,
         alternative_queries=best_semantic,
-        top_k=limit
+        top_k=limit,
     )
     t5 = time.time()
     print(f"      -> Reranking Completed in {t5 - t4:.2f}s (Total: {t5 - t_start:.2f}s)")

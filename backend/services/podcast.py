@@ -14,6 +14,8 @@ from retrieval.query_rewriter import rewrite_query_ensemble
 from services.prosody_planner import ProsodyPlanner
 from services.audio_processor import audio_master
 from json_utils import safe_json_load
+from services.embedding_runtime import EmbeddingRequestContext
+from services.phase_logging import PhaseTrace
 from services.llm import call_gemini_async
 from retrieval.bm25_index import BM25ChunkIndex
 
@@ -172,9 +174,14 @@ def apply_tension_model(state: EpisodeState, segment: PodcastSegment):
 # ============================================
 
 async def generate_podcast_audio(script: List[PodcastSegment], output_path: str) -> bool:
+    trace = PhaseTrace(
+        "PODCAST-AUDIO",
+        f"segments={len(script)}|output={Path(output_path).name}",
+    )
     import edge_tts
 
     if not shutil.which("ffmpeg"):
+        trace.failure(detail="ffmpeg_not_available")
         return False
 
     planner = ProsodyPlanner()  # isolate per episode
@@ -216,8 +223,10 @@ async def generate_podcast_audio(script: List[PodcastSegment], output_path: str)
             return temp
 
     try:
+        synth_start = trace.start_phase("Segment Synthesis")
         tasks = [synth_segment(i, s) for i, s in enumerate(script)]
         temp_files = await asyncio.gather(*tasks)
+        trace.complete_phase("Segment Synthesis", synth_start, detail=f"segments={len(temp_files)}")
 
         concat_file = AUDIO_OUTPUT_DIR / f"concat_{uuid.uuid4().hex}.txt"
         with open(concat_file, "w") as f:
@@ -227,6 +236,7 @@ async def generate_podcast_audio(script: List[PodcastSegment], output_path: str)
         merged = output_path.replace(".mp3", "_merged.wav")
 
         # AC-53: Use Asynchronous Subprocess to prevent event loop blocking
+        concat_start = trace.start_phase("Audio Concatenation")
         process_concat = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y",
             "-f", "concat",
@@ -238,9 +248,11 @@ async def generate_podcast_audio(script: List[PodcastSegment], output_path: str)
             stderr=asyncio.subprocess.DEVNULL
         )
         await process_concat.wait()
+        trace.complete_phase("Audio Concatenation", concat_start)
 
         os.remove(concat_file)
 
+        encode_start = trace.start_phase("MP3 Encoding")
         process_encode = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y",
             "-i", merged,
@@ -251,19 +263,25 @@ async def generate_podcast_audio(script: List[PodcastSegment], output_path: str)
             stderr=asyncio.subprocess.DEVNULL
         )
         await process_encode.wait()
+        trace.complete_phase("MP3 Encoding", encode_start)
 
         os.remove(merged)
 
         mastered = output_path.replace(".mp3", "_mastered.mp3")
         # Mastering is CPU intensive, offload to thread
+        master_start = trace.start_phase("Audio Mastering")
         if await asyncio.to_thread(audio_master.master_podcast, output_path, mastered):
             os.remove(output_path)
             os.rename(mastered, output_path)
+            trace.complete_phase("Audio Mastering", master_start, detail="mastered=True")
+        else:
+            trace.complete_phase("Audio Mastering", master_start, detail="mastered=False")
 
+        trace.success(detail=f"output={Path(output_path).name}")
         return True
 
     except Exception as e:
-        print(f"PODCAST AUDIO ERROR: {e}")
+        trace.failure(detail=f"audio_error={e}")
         return False
 
     finally:
@@ -290,6 +308,11 @@ async def generate_podcast_script(
 ) -> Optional[List[PodcastSegment]]:
 
     llm_fn = call_gemini_fn or call_gemini_async
+    trace = PhaseTrace(
+        "PODCAST-SCRIPT",
+        f"batch={batch_id}|topic={topic}|complexity={complexity}",
+    )
+    trace.log("Starting podcast script generation")
     
     COMPLEXITY_MAP = {
         "5-Year-Old": "Explain like I'm five. Use very simple language, analogies, and keep it very brief.",
@@ -301,25 +324,51 @@ async def generate_podcast_script(
     complexity_instr = COMPLEXITY_MAP.get(complexity, COMPLEXITY_MAP["Undergrad"])
 
     try:
-        rewrite = await rewrite_query_ensemble(topic, llm_fn, 3, 2, use_llm=True)
+        embedding_context = EmbeddingRequestContext()
+        rewrite_start = trace.start_phase("Query Rewriting")
+        rewrite = await rewrite_query_ensemble(
+            topic,
+            llm_fn,
+            3,
+            2,
+            use_llm=True,
+            embedding_context=embedding_context,
+        )
+        trace.complete_phase(
+            "Query Rewriting",
+            rewrite_start,
+            detail=f"rewrites={len(rewrite.get('rewrites', []))}",
+        )
         rewrites = rewrite.get("rewrites", [{"query": topic, "weight": 1.0}])
 
+        retrieval_start = trace.start_phase("Retrieval & Reranking")
         candidates = await retrieve_candidates(
             query=topic,
             rewrites=rewrites,
             bm25=bm25,
             graph=graph,
             chunk_fetcher=chunk_fetcher,
-            dense_fn=dense_retrieve_fn,
+            dense_fn=lambda q, batch_id, top_k=50: dense_retrieve_fn(
+                q,
+                batch_id=batch_id,
+                top_k=top_k,
+                embedding_context=embedding_context,
+            ),
             batch_id=batch_id,
             dense_top_k=15,
             max_candidates=6,
             min_dense_score=0.30, # AC-35: Enforce Chat-level precision
             correlation_id=f"podcast_{topic[:10]}"
         )
+        trace.complete_phase(
+            "Retrieval & Reranking",
+            retrieval_start,
+            detail=f"candidates={len(candidates)}",
+        )
 
 
         if not candidates:
+            trace.log("No relevant context found")
             raise PodcastRefusalError("Not enough resource to generate podcast")
 
         context = "\n\n".join(
@@ -362,35 +411,46 @@ SOURCE:
 {context}
 """
 
+        llm_start = trace.start_phase("LLM Script Generation")
         response = await llm_fn(prompt)
+        trace.complete_phase("LLM Script Generation", llm_start)
         
         if "NO_RELEVANT_CONTEXT" in response:
-            print(f"PODCAST ALERT: LLM refused generation due to lack of context for topic '{topic}'")
+            trace.log("LLM refused generation due to lack of context")
             raise PodcastRefusalError("Not enough resource to generate podcast")
 
         try:
+            parse_start = trace.start_phase("Script Parsing & Validation")
             data = safe_json_load(response)
         except Exception as pe:
-            print(f"PODCAST ERROR: JSON Parse failed. Raw response snippet: {response[:200]}...")
+            trace.failure(detail=f"json_parse_error={pe}")
             raise RuntimeError(f"Failed to parse podcast JSON: {pe}")
 
         try:
             segments = validate_script(data)
         except Exception as ve:
-            print(f"PODCAST ERROR: Script validation failed: {ve}")
+            trace.failure(detail=f"script_validation_error={ve}")
             raise RuntimeError(f"Invalid podcast script structure: {ve}")
+        trace.complete_phase(
+            "Script Parsing & Validation",
+            parse_start,
+            detail=f"segments={len(segments)}",
+        )
 
         # Apply tension model
+        tension_start = trace.start_phase("Tension Model")
         episode_state = EpisodeState(len(segments))
         for seg in segments:
             apply_tension_model(episode_state, seg)
+        trace.complete_phase("Tension Model", tension_start)
 
+        trace.success(detail=f"segments={len(segments)}")
         return segments
 
     except Exception as e:
         if isinstance(e, (RuntimeError, PodcastRefusalError)):
             raise
-        print(f"PODCAST CRITICAL: Script generation crashed: {e}")
+        trace.failure(detail=f"critical_error={e}")
         return None
 
 
@@ -408,23 +468,38 @@ async def generate_podcast(
     batch_id: str = "default_batch",
     complexity: str = "Undergrad"
 ) -> Optional[Podcast]:
+    trace = PhaseTrace(
+        "PODCAST-SVC",
+        f"batch={batch_id}|topic={topic}|complexity={complexity}",
+    )
+    trace.log("Starting podcast generation")
 
+    script_start = trace.start_phase("Script Generation")
     segments = await generate_podcast_script(
         topic, bm25, graph, chunk_fetcher, dense_retrieve_fn, call_gemini_fn, batch_id=batch_id, complexity=complexity
     )
+    trace.complete_phase(
+        "Script Generation",
+        script_start,
+        detail=f"segments={len(segments) if segments else 0}",
+    )
 
     if not segments:
+        trace.log("Podcast generation returned no script")
         return None
 
     podcast_id = str(uuid.uuid4())
     filename = f"{podcast_id}.mp3"
     full_path = str(AUDIO_OUTPUT_DIR / filename)
 
+    audio_start = trace.start_phase("Audio Rendering")
     success = await generate_podcast_audio(segments, full_path)
+    trace.complete_phase("Audio Rendering", audio_start, detail=f"audio_ready={success}")
 
     total_words = sum(len(s.text.split()) for s in segments)
     duration = (total_words / 150) * 60
 
+    trace.success(detail=f"duration_seconds={round(duration, 2)}")
     return Podcast(
         id=podcast_id,
         topic=topic,

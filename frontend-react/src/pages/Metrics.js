@@ -1,15 +1,17 @@
 import React, { useState, useEffect } from 'react';
 import { fetchMetrics, clearMetrics } from '../api';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
 
 function Metrics() {
   const [metrics, setMetrics] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [timeRange, setTimeRange] = useState('24h');
 
   const loadMetrics = async () => {
     try {
       setLoading(true);
-      const data = await fetchMetrics();
+      const data = await fetchMetrics(timeRange);
       setMetrics(data);
       setError(null);
     } catch (err) {
@@ -21,9 +23,9 @@ function Metrics() {
 
   useEffect(() => {
     loadMetrics();
-    const interval = setInterval(loadMetrics, 10000); // Refresh every 10s
+    const interval = setInterval(loadMetrics, 15000); // Refresh every 15s
     return () => clearInterval(interval);
-  }, []);
+  }, [timeRange]);
 
   const handleClear = async () => {
     if (window.confirm("Are you sure you want to clear all historical metrics?")) {
@@ -45,32 +47,76 @@ function Metrics() {
           <h2>System Performance & Logs</h2>
           <p>Monitor LLM usage, latency, and hardware stability.</p>
         </div>
-        <button onClick={handleClear} className="control-btn secondary" style={{ background: '#fff1f0', color: '#f5222d', border: '1px solid #ffa39e' }}>
-          Clear Logs
-        </button>
+        <div style={{ display: 'flex', gap: '10px' }}>
+          <select 
+            value={timeRange} 
+            onChange={(e) => setTimeRange(e.target.value)}
+            style={{ padding: '8px 12px', borderRadius: '6px', border: '1px solid #d9d9d9', outline: 'none' }}
+          >
+            <option value="1h">Last 1 Hour</option>
+            <option value="24h">Last 24 Hours</option>
+            <option value="7d">Last 7 Days</option>
+            <option value="30d">Last 30 Days</option>
+          </select>
+          <button onClick={handleClear} className="control-btn secondary" style={{ background: '#fff1f0', color: '#f5222d', border: '1px solid #ffa39e' }}>
+            Clear Logs
+          </button>
+        </div>
       </div>
 
       {error && <div className="upload-status error">{error}</div>}
 
       {metrics && (
         <div style={{ marginTop: '30px' }}>
+          {/* Charts Row */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', marginBottom: '30px' }}>
+            <div style={{ background: 'white', padding: '20px', borderRadius: '12px', border: '1px solid #eaeaea' }}>
+              <h4 style={{ margin: '0 0 20px 0', fontSize: '0.9rem', color: '#595959' }}>Requests Per {timeRange === '1h' ? 'Minute' : (timeRange === '24h' ? 'Hour' : 'Day')}</h4>
+              <div style={{ height: '250px', width: '100%' }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={metrics.chart_data}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f0f0f0" />
+                    <XAxis dataKey="time" fontSize={10} tickMargin={10} />
+                    <YAxis fontSize={10} />
+                    <Tooltip />
+                    <Area type="monotone" dataKey="calls" stroke="#1890ff" fill="#e6f7ff" strokeWidth={2} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+            <div style={{ background: 'white', padding: '20px', borderRadius: '12px', border: '1px solid #eaeaea' }}>
+              <h4 style={{ margin: '0 0 20px 0', fontSize: '0.9rem', color: '#595959' }}>Tokens Per {timeRange === '1h' ? 'Minute' : (timeRange === '24h' ? 'Hour' : 'Day')}</h4>
+              <div style={{ height: '250px', width: '100%' }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={metrics.chart_data}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f0f0f0" />
+                    <XAxis dataKey="time" fontSize={10} tickMargin={10} />
+                    <YAxis fontSize={10} />
+                    <Tooltip />
+                    <Area type="monotone" dataKey="tokens" stroke="#52c41a" fill="#f6ffed" strokeWidth={2} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
+
           {/* LLM Dashboard */}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '20px', marginBottom: '40px' }}>
             <div className="metric-card" style={cardStyle}>
               <div style={labelStyle}>Total LLM Calls</div>
-              <div style={valueStyle}>{metrics.summary.total_calls}</div>
+              <div style={valueStyle}>{metrics.summary?.total_calls || 0}</div>
             </div>
             <div className="metric-card" style={cardStyle}>
               <div style={labelStyle}>Total Tokens</div>
-              <div style={valueStyle}>{metrics.summary.total_tokens.toLocaleString()}</div>
+              <div style={valueStyle}>{(metrics.summary?.total_tokens || 0).toLocaleString()}</div>
             </div>
             <div className="metric-card" style={cardStyle}>
               <div style={labelStyle}>Prompt / Completion</div>
-              <div style={valueStyle}>{metrics.summary.prompt_tokens.toLocaleString()} / {metrics.summary.candidates_tokens.toLocaleString()}</div>
+              <div style={valueStyle}>{(metrics.summary?.prompt_tokens || 0).toLocaleString()} / {(metrics.summary?.candidates_tokens || 0).toLocaleString()}</div>
             </div>
             <div className="metric-card" style={{ ...cardStyle, background: '#f6ffed', border: '1px solid #b7eb8f' }}>
               <div style={labelStyle}>Est. Cost (USD)</div>
-              <div style={{ ...valueStyle, color: '#52c41a' }}>${metrics.summary.estimated_cost_usd.toFixed(4)}</div>
+              <div style={{ ...valueStyle, color: '#52c41a' }}>${(metrics.summary?.estimated_cost_usd || 0).toFixed(4)}</div>
             </div>
           </div>
 

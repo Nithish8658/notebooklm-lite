@@ -23,7 +23,7 @@ def ingest_excel(file_path: Path, document_id: str) -> List[Dict[str, Any]]:
         print(f"CRITICAL: Failed to open Excel file {file_path}: {e}")
         return []
 
-    for sheet_name in xls.sheet_names:
+    for sheet_index, sheet_name in enumerate(xls.sheet_names, start=1):
         try:
             # 1. Convert Sheet to Raw CSV String
             # header=None ensures we treat the first row (headers) as data 
@@ -54,8 +54,11 @@ def ingest_excel(file_path: Path, document_id: str) -> List[Dict[str, Any]]:
                     "document_id": document_id,
                     "text": chunk_text,
                     "block_type": "excel_deterministic_chunk",
+                    "section_title": sheet_name or f"Sheet {sheet_index}",
+                    "section_level": 1,
                     "metadata": {
                         "filename": file_path.name,
+                        "sheet_index": sheet_index,
                         "sheet_name": sheet_name,
                         "sequential_index": seq_index,
                         "is_last_chunk": (i + chunk_size >= total_chars),

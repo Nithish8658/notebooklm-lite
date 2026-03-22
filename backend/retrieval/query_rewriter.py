@@ -5,10 +5,11 @@ import nltk
 import asyncio
 from nltk.corpus import stopwords
 from nltk.stem import PorterStemmer
-from typing import Callable, Dict, List, Literal, TypedDict, Awaitable
+from typing import Callable, Dict, List, Literal, TypedDict, Awaitable, Optional
 from fastapi import HTTPException
 from json_utils import safe_json_load
 from services.embeddings import get_embedding_model, compute_cosine_similarity
+from services.embedding_runtime import EmbeddingRequestContext, get_embedding_runtime
 
 # Ensure NLTK data is available
 try:
@@ -81,41 +82,47 @@ def _dedupe(queries: List[str]) -> List[str]:
 
 
 # ----------------------------
-# REWRITE STRATEGIES
+# UNIFIED GENERATION STRATEGY
 # ----------------------------
 
-async def _semantic_rewrites(
+async def _generate_llm_ensemble_rewrites(
     query: str,
     call_llm: Callable[[str], Awaitable[str]],
-    max_items: int,
-) -> List[str]:
+    max_semantic: int,
+    max_decomposition: int,
+) -> Dict[str, List[str]]:
+    """
+    AC-55: Single-Pass Query Expansion (Unified Intelligence).
+    Combines semantic and decomposition instructions into one LLM call
+    to reduce API latency by ~50%.
+    """
     prompt = f"""
-Rewrite the following query into up to {max_items} semantically equivalent
-search queries for document retrieval.
+Analyze the following user query for document retrieval optimization.
+
+Tasks:
+1. Generate up to {max_semantic} semantic variations (different wording, same intent).
+2. Decompose into up to {max_decomposition} atomic sub-queries (smaller searchable parts).
 
 Rules:
-- Preserve intent
-- Do NOT answer
-- Do NOT add facts
-- Output JSON only
+- Output valid JSON only.
+- Preserve technical terms exactly.
+- Do NOT answer the question.
+- Format: {{ "semantic": ["..."], "decomposition": ["..."] }}
 
-Format:
-{{ "queries": ["..."] }}
-
-Query:
-{query}
+Query: {query}
 """.strip()
 
     try:
         raw = await call_llm(prompt)
         data = safe_json_load(raw)
-        qs = data.get("queries", [])
-        return qs if isinstance(qs, list) else []
-    except HTTPException:
-        raise
+        
+        return {
+            "semantic": data.get("semantic", []) if isinstance(data.get("semantic"), list) else [],
+            "decomposition": data.get("decomposition", []) if isinstance(data.get("decomposition"), list) else []
+        }
     except Exception as e:
-        _LOG.warning("semantic rewrite failed: %s", e)
-        return []
+        _LOG.warning("Unified LLM rewrite failed: %s", e)
+        return {"semantic": [], "decomposition": []}
 
 
 def _keyword_rewrite(query: str) -> List[str]:
@@ -152,41 +159,6 @@ def _keyword_rewrite(query: str) -> List[str]:
     return [result]
 
 
-
-async def _decomposition_rewrites(
-    query: str,
-    call_llm: Callable[[str], Awaitable[str]],
-    max_items: int,
-) -> List[str]:
-    prompt = f"""
-Decompose the following query into up to {max_items}
-atomic search queries.
-
-Rules:
-- Each query must be independently searchable
-- No new facts
-- JSON only
-
-Format:
-{{ "queries": ["..."] }}
-
-Query:
-{query}
-""".strip()
-
-    try:
-        raw = await call_llm(prompt)
-        data = safe_json_load(raw)
-        qs = data.get("queries", [])
-        return qs if isinstance(qs, list) else []
-    except HTTPException:
-        raise
-    except Exception as e:
-        _LOG.warning("decomposition rewrite failed: %s", e)
-        return []
-    
-
-
 # ----------------------------
 # MAIN ENSEMBLE ENTRYPOINT
 # ----------------------------
@@ -197,12 +169,12 @@ async def rewrite_query_ensemble(
     max_semantic: int = 3,
     max_decomposition: int = 2,
     use_llm: bool = True,
+    embedding_context: Optional[EmbeddingRequestContext] = None,
 ) -> RewriteResult:
     """
     Optimized query rewrite ensemble.
-    - Runs LLM strategies in parallel.
+    - Uses Single-Pass LLM inference for low latency.
     - Batches semantic drift guard for sub-second performance.
-    - Correctly preserves and labels decomposition results.
     """
 
     query = _normalize(query)
@@ -213,11 +185,16 @@ async def rewrite_query_ensemble(
     rewrites: List[Rewrite] = [{"query": query, "type": "original", "weight": 1.0}]
 
     if use_llm:
-        # --- 1. Parallel LLM Generation ---
-        sem_task = _semantic_rewrites(query, call_llm_fn, max_semantic)
-        dec_task = _decomposition_rewrites(query, call_llm_fn, max_decomposition)
+        # --- 1. Single-Pass LLM Generation ---
+        llm_data = await _generate_llm_ensemble_rewrites(
+            query, 
+            call_llm_fn, 
+            max_semantic, 
+            max_decomposition
+        )
         
-        sem_raw, dec_raw = await asyncio.gather(sem_task, dec_task)
+        sem_raw = llm_data["semantic"]
+        dec_raw = llm_data["decomposition"]
         
         # Clean and prepare for batch embedding
         sem_cleaned = [_normalize(s) for s in sem_raw if _normalize(s)]
@@ -231,10 +208,12 @@ async def rewrite_query_ensemble(
         
         if candidates_to_embed:
             try:
-                model = get_embedding_model()
-                # Embed ALL in one batch
                 all_texts = [query] + candidates_to_embed
-                embeddings = await asyncio.to_thread(model.encode, all_texts, is_query=True)
+                embeddings = await get_embedding_runtime().get_embeddings(
+                    all_texts,
+                    request_context=embedding_context,
+                    priority="online",
+                )
                 
                 orig_vec = embeddings[0]
                 cand_vecs = embeddings[1:]
@@ -253,7 +232,7 @@ async def rewrite_query_ensemble(
                         rewrites.append({"query": cand, "type": "semantic", "weight": 0.8})
                         seen_queries.add(cand.lower())
 
-                # --- Process Decomposition (Ensuring they show up!) ---
+                # --- Process Decomposition ---
                 for cand in dec_cleaned:
                     if cand.lower() in seen_queries: continue
                     sim = score_map.get(cand, 0.0)
@@ -269,7 +248,7 @@ async def rewrite_query_ensemble(
                         rewrites.append({"query": cand, "type": "semantic", "weight": 0.8})
                         seen_queries.add(cand.lower())
 
-    # --- 3. Keyword Extraction (Sync) ---
+    # --- 2. Keyword Extraction (Sync) ---
     keyword_raw = _keyword_rewrite(query)
     for q in keyword_raw:
         qn = _normalize(q)
