@@ -4,6 +4,8 @@ import uuid
 import asyncio
 from pydantic import BaseModel, Field
 from services.llm import call_gemini_async
+from services.embedding_runtime import EmbeddingRequestContext
+from services.phase_logging import PhaseTrace
 from retrieval.query_rewriter import rewrite_query_ensemble
 from services.retrieval import retrieve_candidates
 from json_utils import safe_json_load
@@ -44,8 +46,11 @@ async def generate_quiz_for_topic(
     Generates a quiz (set of MCQs) for a specific topic (Async/Stateless).
     """
     llm_fn = call_gemini_fn or call_gemini_async
-    
-    print(f"Generating quiz for topic: {topic} at complexity: {complexity}")
+    trace = PhaseTrace(
+        "QUIZ-TOPIC",
+        f"batch={batch_id}|topic={topic}|complexity={complexity}",
+    )
+    trace.log("Starting quiz generation")
     
     complexity_map = {
         "5-Year-Old": "Create very simple, fundamental questions. Avoid any complex terms.",
@@ -57,29 +62,54 @@ async def generate_quiz_for_topic(
 
     # 1. Retrieve Context
     try:
-        rewrite_result = await rewrite_query_ensemble(topic, llm_fn, 3, 2, use_llm=True)
+        embedding_context = EmbeddingRequestContext()
+        rewrite_start = trace.start_phase("Query Rewriting")
+        rewrite_result = await rewrite_query_ensemble(
+            topic,
+            llm_fn,
+            3,
+            2,
+            use_llm=True,
+            embedding_context=embedding_context,
+        )
+        trace.complete_phase(
+            "Query Rewriting",
+            rewrite_start,
+            detail=f"rewrites={len(rewrite_result.get('rewrites', []))}",
+        )
         rewrites = rewrite_result.get("rewrites", [{"query": topic, "weight": 1.0}])
         
+        retrieval_start = trace.start_phase("Retrieval & Reranking")
         candidates = await retrieve_candidates(
             query=topic,
             rewrites=rewrites,
             bm25=bm25,
             graph=graph,
             chunk_fetcher=chunk_fetcher,
-            dense_fn=dense_retrieve_fn,
+            dense_fn=lambda q, batch_id, top_k=50: dense_retrieve_fn(
+                q,
+                batch_id=batch_id,
+                top_k=top_k,
+                embedding_context=embedding_context,
+            ),
             batch_id=batch_id,
             dense_top_k=50,
             max_candidates=6,
             min_dense_score=0.30,
             correlation_id=f"quiz_{topic[:10]}"
         )
+        trace.complete_phase(
+            "Retrieval & Reranking",
+            retrieval_start,
+            detail=f"candidates={len(candidates)}",
+        )
 
     except Exception as e:
-        print(f"Retrieval failed for quiz topic '{topic}': {e}")
+        trace.failure(detail=f"retrieval_error={e}")
         return None
 
     if not candidates:
-        print(f"No candidates found for quiz topic: {topic}")
+        trace.log("No relevant context found")
         return None
 
     context_text = "\n\n".join([
@@ -133,7 +163,11 @@ async def generate_quiz_for_topic(
     """
 
     try:
+        llm_start = trace.start_phase("LLM Quiz Generation")
         response_text = await llm_fn(prompt)
+        trace.complete_phase("LLM Quiz Generation", llm_start)
+
+        parse_start = trace.start_phase("Response Parsing & Validation")
         data = safe_json_load(response_text)
         
         questions_data = data.get("questions", [])
@@ -145,15 +179,22 @@ async def generate_quiz_for_topic(
                 if q["correct_option_id"] not in ["A", "B", "C", "D"]: continue
                 valid_questions.append(QuizQuestion(**q))
             except Exception as e:
-                print(f"Skipping invalid question: {e}")
+                trace.log("Skipping invalid question", detail=str(e))
                 continue
         
         if not valid_questions:
-            print("No valid questions generated.")
+            trace.complete_phase("Response Parsing & Validation", parse_start, detail="valid_questions=0")
+            trace.log("No valid questions generated")
             return None
 
+        trace.complete_phase(
+            "Response Parsing & Validation",
+            parse_start,
+            detail=f"valid_questions={len(valid_questions)}",
+        )
+        trace.success(detail=f"generated_questions={len(valid_questions)}")
         return Quiz(topic=topic, questions=valid_questions)
 
     except Exception as e:
-        print(f"Quiz generation failed: {e}")
+        trace.failure(detail=f"generation_error={e}")
         return None

@@ -53,12 +53,41 @@ def build_chunk_graph(chunks: List[Dict]) -> Dict[str, Dict[str, List[str]]]:
     # ---- Indexing & Pre-processing ----
     by_doc = defaultdict(list)
     keyword_index = defaultdict(list)
+
+    def _safe_int(value, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
     
     def _safe_page(c: Dict) -> int:
         pgs = c.get("pages", [])
         if not pgs: return 0
         val = pgs[0]
         return val if val is not None else 0
+
+    def _is_excel_chunk(c: Dict) -> bool:
+        metadata = c.get("metadata", {})
+        return c.get("block_type") == "excel_deterministic_chunk" or (
+            metadata.get("sheet_name") is not None and metadata.get("sequential_index") is not None
+        )
+
+    def _chunk_sort_key(c: Dict):
+        metadata = c.get("metadata", {})
+        if _is_excel_chunk(c):
+            sheet_index = _safe_int(metadata.get("sheet_index"), 0)
+            sheet_name = str(metadata.get("sheet_name") or c.get("section_title") or "General")
+            sequential_index = _safe_int(metadata.get("sequential_index"), 0)
+            return (0, sheet_index, sheet_name, sequential_index, c["chunk_id"])
+        return (1, c["_page"], c["chunk_id"])
+
+    def _section_key(c: Dict):
+        metadata = c.get("metadata", {})
+        if _is_excel_chunk(c):
+            sheet_index = _safe_int(metadata.get("sheet_index"), 0)
+            sheet_name = str(metadata.get("sheet_name") or c.get("section_title") or "General")
+            return (1, f"excel_sheet::{sheet_index}:{sheet_name}")
+        return (c.get("section_level", 1), c.get("section_title", "General"))
 
     for c in chunks:
         cid = c["chunk_id"]
@@ -95,7 +124,7 @@ def build_chunk_graph(chunks: List[Dict]) -> Dict[str, Dict[str, List[str]]]:
     # ---- 2. DOCUMENT STRUCTURAL EDGES ----
     for doc_id, doc_chunks in by_doc.items():
         # Sort chunks globally for the document to identify linear flow
-        doc_ordered = sorted(doc_chunks, key=lambda c: (c["_page"], c["chunk_id"]))
+        doc_ordered = sorted(doc_chunks, key=_chunk_sort_key)
         
         # Organize by sections
         sections = defaultdict(list)
@@ -106,14 +135,14 @@ def build_chunk_graph(chunks: List[Dict]) -> Dict[str, Dict[str, List[str]]]:
         ordered_section_keys = []
         
         for c in doc_ordered:
-            sec_key = (c.get("section_level", 1), c.get("section_title", "General"))
+            sec_key = _section_key(c)
             if sec_key not in sections:
                 ordered_section_keys.append(sec_key)
             sections[sec_key].append(c)
 
         # ---- Linear Same-Section Edges ----
         for sec_key, sec_chunks in sections.items():
-            sec_ordered = sorted(sec_chunks, key=lambda x: (x["_page"], x["chunk_id"]))
+            sec_ordered = sorted(sec_chunks, key=_chunk_sort_key)
             for i in range(len(sec_ordered) - 1):
                 a, b = sec_ordered[i]["chunk_id"], sec_ordered[i+1]["chunk_id"]
                 graph[a]["same_section"].append(b)

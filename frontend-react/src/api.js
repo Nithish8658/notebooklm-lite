@@ -60,11 +60,18 @@ async function pollJob(jobId) {
 /* ======================
    CHAT
    ====================== */
-export async function sendMessage(username, activeBatchId, message, complexity = "Undergrad", tutorMode = false) {
+export async function sendMessage(username, activeBatchId, message, complexity = "Undergrad", tutorMode = false, bypassRag = false) {
   const res = await fetch(`${BASE_URL}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username: username, active_batch_id: activeBatchId, message, complexity, tutor_mode: tutorMode })
+    body: JSON.stringify({ 
+      username: username, 
+      active_batch_id: activeBatchId, 
+      message, 
+      complexity, 
+      tutor_mode: tutorMode,
+      bypass_rag: bypassRag 
+    })
   });
 
   const data = await res.json();
@@ -73,7 +80,13 @@ export async function sendMessage(username, activeBatchId, message, complexity =
     throw new Error(data.detail || "Unknown server error");
   }
 
-  return data.reply;
+  if (typeof data?.reply === "string") {
+    return data.reply;
+  }
+  if (data?.reply == null) {
+    return "";
+  }
+  return String(data.reply);
 }
 
 /* ======================

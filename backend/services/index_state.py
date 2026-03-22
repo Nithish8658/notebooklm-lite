@@ -190,4 +190,12 @@ class IndexStateManager:
                 del self._cache[batch_id]
                 handle.brain = None
 
+    async def clear_all(self):
+        async with self._global_lock:
+            for handle in self._cache.values():
+                handle.state = ResourceState.EVICTING
+                handle.brain = None
+            self._cache.clear()
+            self._current_memory_bytes = 0
+
 index_manager = IndexStateManager(max_memory_mb=2048)

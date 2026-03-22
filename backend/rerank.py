@@ -1,6 +1,7 @@
 import os
 import sys
 import logging
+import threading
 from typing import List, Dict, Optional
 from pathlib import Path
 from collections import OrderedDict
@@ -39,7 +40,13 @@ CALIBRATION_TEMP = 1.0
 
 # ---------- ONNX MODEL WRAPPER ----------
 class OnnxCrossEncoder:
-    def __init__(self, model_id: str = _DEFAULT_MODEL_NAME):
+    def __init__(
+        self,
+        model_id: str = _DEFAULT_MODEL_NAME,
+        *,
+        num_threads: int | None = None,
+        num_streams: int | None = None,
+    ):
         # Path: backend/rerank.py -> backend/models/reranker-onnx
         project_root = Path(__file__).resolve().parent
         onnx_dir = project_root / "models" / "reranker-onnx"
@@ -68,13 +75,16 @@ class OnnxCrossEncoder:
                  model_filename, subfolder or "root", onnx_dir)
         
         # 1. Thread Management: Hardware-Aware and Scale-Safe
-        env_threads = os.getenv("RERANKER_THREADS")
-        if env_threads:
-            num_threads = int(env_threads)
+        if num_threads is None:
+            env_threads = os.getenv("RERANKER_THREADS")
+            if env_threads:
+                num_threads = int(env_threads)
+            else:
+                total_cores = multiprocessing.cpu_count()
+                num_threads = min(4, max(1, total_cores // 2))
         else:
             total_cores = multiprocessing.cpu_count()
-            # Optimization: 4 threads is often the sweet spot for MiniLM on consumer CPUs
-            num_threads = min(4, max(1, total_cores // 2))
+            num_threads = max(1, min(int(num_threads), total_cores))
             
         _LOG.info("CPU Optimization: Using %d threads for reranking inference.", num_threads)
 
@@ -89,12 +99,13 @@ class OnnxCrossEncoder:
 
         if "OpenVINOExecutionProvider" in available_providers:
             provider = "OpenVINOExecutionProvider"
-            # Optimization: num_streams=1 reduces latency for single-user queries
+            if num_streams is None:
+                num_streams = int(os.getenv("RERANK_OPENVINO_STREAMS", "1"))
             provider_options = {
                 "device_type": "CPU",
-                "num_streams": "1"
+                "num_streams": str(max(1, int(num_streams)))
             }
-            _LOG.info("OpenVINO detected. Enabling high-speed Intel inference (Latency Mode).")
+            _LOG.info("OpenVINO detected. Enabling CPU inference with %s stream(s).", provider_options["num_streams"])
         
         # Use .as_posix() for Windows path compatibility
         self.tokenizer = AutoTokenizer.from_pretrained(onnx_dir.as_posix(), local_files_only=True)
@@ -198,24 +209,28 @@ class _ScoreCache:
     def __init__(self, maxsize: int = 10000):
         self._maxsize = maxsize
         self._data = OrderedDict()
+        self._lock = threading.Lock()
 
     def get(self, key):
-        try:
-            val = self._data.pop(key)
-            self._data[key] = val
-            return val
-        except KeyError:
-            return None
+        with self._lock:
+            try:
+                val = self._data.pop(key)
+                self._data[key] = val
+                return val
+            except KeyError:
+                return None
 
     def set(self, key, value):
-        if key in self._data:
-            self._data.pop(key)
-        elif len(self._data) >= self._maxsize:
-            self._data.popitem(last=False)
-        self._data[key] = value
+        with self._lock:
+            if key in self._data:
+                self._data.pop(key)
+            elif len(self._data) >= self._maxsize:
+                self._data.popitem(last=False)
+            self._data[key] = value
 
     def __contains__(self, key):
-        return key in self._data
+        with self._lock:
+            return key in self._data
 
     def __getitem__(self, key):
         return self.get(key)
@@ -226,13 +241,18 @@ class _ScoreCache:
 
 _cache_size = int(os.getenv("SCORE_CACHE_SIZE", "50000"))
 _SCORE_CACHE = _ScoreCache(maxsize=_cache_size)
+ScoreCache = _ScoreCache
 
 
 # ---------- SINGLETON ----------
+def create_reranker(*, num_threads: int | None = None, num_streams: int | None = None) -> OnnxCrossEncoder:
+    return OnnxCrossEncoder(num_threads=num_threads, num_streams=num_streams)
+
+
 def load_reranker():
     global _RERANKER_MODEL
     if _RERANKER_MODEL is None:
-        _RERANKER_MODEL = OnnxCrossEncoder()
+        _RERANKER_MODEL = create_reranker()
     return _RERANKER_MODEL
 
 def get_reranker():
@@ -254,6 +274,8 @@ def rerank_with_cross_encoder(
     top_k: int | None = None,
     max_rewrites: int | None = None,
     use_fusion: bool = True,
+    model: OnnxCrossEncoder | None = None,
+    score_cache: _ScoreCache | None = None,
 ) -> list[dict]:
     """
     Production-grade Cross-Encoder Reranking with Context-Awareness and Score Fusion.
@@ -271,6 +293,7 @@ def rerank_with_cross_encoder(
     # ---- Config ----
     rerank_top_k = int(os.getenv("RERANKER_TOP_K", "50"))
     output_k = top_k or int(os.getenv("OUTPUT_K", "5"))
+    score_cache = score_cache or _SCORE_CACHE
 
     top_candidates = list(candidates)[: min(len(candidates), rerank_top_k)]
 
@@ -308,8 +331,8 @@ def rerank_with_cross_encoder(
         text = c["_contextual_text"]
         for q in queries:
             key = (q, text)
-            if key in _SCORE_CACHE:
-                cached_scores[key] = _SCORE_CACHE[key]
+            if key in score_cache:
+                cached_scores[key] = score_cache[key]
             elif key not in request_unique_keys:
                 to_score_pairs.append((q, text))
                 to_score_keys.append(key)
@@ -324,7 +347,7 @@ def rerank_with_cross_encoder(
 
     try:
         # PART 2.3: Model Inference
-        model = get_reranker()
+        model = model or get_reranker()
         if to_score_pairs:
             t_inf_start = time.perf_counter()
             scores = model.predict(to_score_pairs, batch_size=batch_size)
@@ -333,7 +356,7 @@ def rerank_with_cross_encoder(
                      t_inf_end - t_inf_start, len(to_score_pairs), ((t_inf_end - t_inf_start)/len(to_score_pairs))*1000)
             
             for key, sc in zip(to_score_keys, scores):
-                _SCORE_CACHE[key] = sc
+                score_cache[key] = sc
                 cached_scores[key] = sc
 
         # ---- PHASE 3: AGGREGATE, FUSE & FILTER ----

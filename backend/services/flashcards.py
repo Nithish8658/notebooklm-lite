@@ -5,6 +5,8 @@ from pydantic import BaseModel, Field
 from services.llm import call_gemini_async
 from json_utils import safe_json_load
 from services.retrieval import retrieve_candidates
+from services.embedding_runtime import EmbeddingRequestContext
+from services.phase_logging import PhaseTrace
 from retrieval.query_rewriter import rewrite_query_ensemble
 from retrieval.bm25_index import BM25ChunkIndex
 
@@ -49,40 +51,76 @@ async def generate_flashcards(
     if not topics or not dense_retrieve_fn:
         return []
 
+    request_trace = PhaseTrace(
+        "FLASHCARDS-SVC",
+        f"batch={batch_id}|topics={len(topics)}|complexity={complexity}",
+    )
+    request_trace.log("Starting flashcard generation")
+
     # AC-52: Internal Semaphore to prevent LLM rate-limiting during fan-out
     # Limits parallel LLM calls to 3 topics at once.
     sem = asyncio.Semaphore(3)
 
     async def generate_for_topic(topic: str) -> List[dict]:
         async with sem:
-            print(f"   [Flashcards] Generating cards for topic: '{topic}'...")
-
-            # Retrieval Pipeline
-            rewrite_result = await rewrite_query_ensemble(topic, llm_fn, 3, 2, use_llm=True)
-            rewrites = rewrite_result.get("rewrites", [{"query": topic, "weight": 1.0}])
-
-            candidates = await retrieve_candidates(
-                query=topic,
-                rewrites=rewrites,
-                bm25=bm25,
-                graph=graph,
-                chunk_fetcher=chunk_fetcher,
-                dense_fn=dense_retrieve_fn,
-                batch_id=batch_id,
-                max_candidates=15,
-                min_dense_score=0.30 
+            topic_trace = PhaseTrace(
+                "FLASHCARDS-TOPIC",
+                f"batch={batch_id}|topic={topic}|complexity={complexity}",
             )
+            topic_trace.log("Starting topic generation")
+            try:
+                embedding_context = EmbeddingRequestContext()
 
-            if not candidates:
-                print(f"   [Flashcards] No context found for topic: '{topic}'.")
-                return []
+                # Retrieval Pipeline
+                rewrite_start = topic_trace.start_phase("Query Rewriting")
+                rewrite_result = await rewrite_query_ensemble(
+                    topic,
+                    llm_fn,
+                    3,
+                    2,
+                    use_llm=True,
+                    embedding_context=embedding_context,
+                )
+                topic_trace.complete_phase(
+                    "Query Rewriting",
+                    rewrite_start,
+                    detail=f"rewrites={len(rewrite_result.get('rewrites', []))}",
+                )
+                rewrites = rewrite_result.get("rewrites", [{"query": topic, "weight": 1.0}])
 
-            context_text = " ".join([
-                f"<CHUNK id='{c.get('doc_id') or c.get('chunk_id')}'>\n{c['text']}\n</CHUNK>"
-                for c in candidates
-            ])
+                retrieval_start = topic_trace.start_phase("Retrieval & Reranking")
+                candidates = await retrieve_candidates(
+                    query=topic,
+                    rewrites=rewrites,
+                    bm25=bm25,
+                    graph=graph,
+                    chunk_fetcher=chunk_fetcher,
+                    dense_fn=lambda q, batch_id, top_k=50: dense_retrieve_fn(
+                        q,
+                        batch_id=batch_id,
+                        top_k=top_k,
+                        embedding_context=embedding_context,
+                    ),
+                    batch_id=batch_id,
+                    max_candidates=15,
+                    min_dense_score=0.30 
+                )
+                topic_trace.complete_phase(
+                    "Retrieval & Reranking",
+                    retrieval_start,
+                    detail=f"candidates={len(candidates)}",
+                )
 
-            prompt = f"""
+                if not candidates:
+                    topic_trace.log("No relevant context found")
+                    return []
+
+                context_text = " ".join([
+                    f"<CHUNK id='{c.get('doc_id') or c.get('chunk_id')}'>\n{c['text']}\n</CHUNK>"
+                    for c in candidates
+                ])
+
+                prompt = f"""
             You are an Expert Knowledge Extraction Engine.
             Your Goal: Create a set of high-quality Flashcards for the specific topic: "{topic}".
             
@@ -112,11 +150,14 @@ async def generate_flashcards(
 
             SOURCES:
             {context_text}
-            
+
             Generate {limit} flashcards for "{topic}" now.
             """
-            try:
+                llm_start = topic_trace.start_phase("LLM Flashcard Generation")
                 response_text = await llm_fn(prompt)
+                topic_trace.complete_phase("LLM Flashcard Generation", llm_start)
+
+                parse_start = topic_trace.start_phase("Response Parsing & Validation")
                 data = safe_json_load(response_text)
                 
                 # Robustness: Handle both list and object responses
@@ -133,16 +174,24 @@ async def generate_flashcards(
                 ]
                 for vc in valid_cards:
                     vc["topic"] = topic
+                topic_trace.complete_phase(
+                    "Response Parsing & Validation",
+                    parse_start,
+                    detail=f"valid_cards={len(valid_cards)}",
+                )
+                topic_trace.success(detail=f"generated_cards={len(valid_cards)}")
                 return valid_cards
             except Exception as e:
-                print(f"   [Flashcards] Failed for '{topic}': {e}")
+                topic_trace.failure(detail=f"topic={topic}, error={e}")
                 return []
 
     # Execute all topics in parallel
+    fanout_start = request_trace.start_phase("Parallel Topic Fan-Out")
     tasks = [generate_for_topic(t) for t in topics]
     results = await asyncio.gather(*tasks)
+    request_trace.complete_phase("Parallel Topic Fan-Out", fanout_start)
 
     # Flatten results
     all_final_cards = [card for topic_cards in results for card in topic_cards]
-    print(f"   [Flashcards] Fan-Out Complete. Total generated: {len(all_final_cards)}")
+    request_trace.success(detail=f"total_generated={len(all_final_cards)}")
     return all_final_cards

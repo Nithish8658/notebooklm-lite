@@ -1,0 +1,51 @@
+{
+  "mode": "execute",
+  "run_started_at": "2026-03-19T08:46:10.134880+00:00",
+  "run_completed_at": "2026-03-19T08:47:34.273489+00:00",
+  "stage_index": 3,
+  "stage_count": 5,
+  "concurrency": 15,
+  "stage_window_seconds": 30,
+  "launch_interval_seconds": 2.14,
+  "base_url": "http://127.0.0.1:8000",
+  "timeout_seconds": 180,
+  "job_timeout_seconds": 900,
+  "poll_interval_seconds": 2.0,
+  "total_jobs": 15,
+  "success_count": 15,
+  "failure_count": 0,
+  "avg_client_total_ms": 24264.97,
+  "max_client_total_ms": 60556.76,
+  "avg_server_total_ms": 16984.36,
+  "max_server_total_ms": 27278.99,
+  "tool_counts": {
+    "chat": 4,
+    "flashcards": 4,
+    "quiz": 4,
+    "podcast": 3
+  },
+  "complexity_counts": {
+    "High School": 5,
+    "PhD Expert": 3,
+    "Undergrad": 4,
+    "5-Year-Old": 3
+  },
+  "detailed_log_file": "C:\\Users\\PC\\V6\\notebooklm-lite\\scripts\\test_logs\\studio_mixed_load_test_20260319_141417_stage03_concurrency_15.jsonl",
+  "manifest": {
+    "8a861151-5d27-4daf-bb1b-6cf9deeff22c": {
+      "username": "nithish-learner",
+      "question_source_name": "8a861151-5d27-4daf-bb1b-6cf9deeff22c_rewritten_questions.md",
+      "pdf_name": "8a861151-5d27-4daf-bb1b-6cf9deeff22c.pdf",
+      "question_count": 60,
+      "sample_question": "What is the purpose of Postman, and why is it commonly used in API development?"
+    },
+    "b33f8473-db92-494d-9216-0cde7e1854e5": {
+      "username": "sathish-learner",
+      "question_source_name": "b33f8473-db92-494d-9216-0cde7e1854e5_rewritten_questions.md",
+      "pdf_name": "b33f8473-db92-494d-9216-0cde7e1854e5.pdf",
+      "question_count": 60,
+      "sample_question": "How can cloud computing be defined?"
+    }
+  },
+  "failures": []
+}

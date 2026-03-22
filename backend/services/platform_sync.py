@@ -14,7 +14,8 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from database import AsyncSessionLocal, User, Batch, UserEnrollment
 from sqlalchemy import select, delete
-from infrastructure import qdrant, redis_client
+from infrastructure import redis_client
+from services.search_repository import SearchRepository
 
 # Load env vars for configuration
 load_dotenv()
@@ -47,6 +48,7 @@ class PlatformSyncService:
         self.access_token = None
         self.batch_name_map = {} # Lookup for batchId -> courseName
         self.current_cycle_id = None
+        self.search_repository = SearchRepository("document_chunks")
         self._init_db()
 
     def _log(self, msg, level=logging.INFO, *args):
@@ -381,11 +383,7 @@ class PlatformSyncService:
                             
                             # A. Remove from Qdrant
                             try:
-                                from qdrant_client.models import Filter, FieldCondition, MatchValue
-                                await qdrant.delete(
-                                    collection_name="document_chunks",
-                                    points_selector=Filter(must=[FieldCondition(key="batch_id", match=MatchValue(value=batch.id))])
-                                )
+                                await self.search_repository.delete_payloads(exact_matches={"batch_id": batch.id})
                             except Exception as e: self._log(f"Failed to purge Qdrant for batch {batch.id}: {e}", logging.ERROR)
 
                             # B. Remove Physical Files

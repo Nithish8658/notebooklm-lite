@@ -36,21 +36,24 @@ from ingestion.video_ingestor import ingest_video_file
 from ingestion.youtube_ingestor_whisperx import ingest_youtube_video, load_whisperx_model
 from ingestion.web_ingestor import WebIngestor
 from chunking.semantic_chunker import semantic_chunk_blocks
-from graph.chunk_graph import build_chunk_graph
-from retrieval.bm25_index import BM25ChunkIndex
 from retrieval.query_rewriter import rewrite_query_ensemble
 from services.retrieval import retrieve_candidates
 from services.llm import call_gemini_async
-from rerank import load_reranker, get_reranker, rerank_with_cross_encoder
 from services.flashcards import generate_flashcards
 from services.quiz import generate_quiz_for_topic
 from services.podcast import generate_podcast, PodcastRefusalError
 
 from database import init_db, get_db, User, Flashcard, Quiz, Podcast, Batch, UserEnrollment, IngestionJob, AsyncSessionLocal
+from services.batch_metadata_service import get_batch_metadata_service
 from services.index_state import index_manager
 from celery_app import celery_app
-from services.embeddings import BatchEmbeddingManager, get_embedding_model, load_embedding_model
+from services.embeddings import get_embedding_model, load_embedding_model
+from services.embedding_runtime import EmbeddingRequestContext, get_embedding_runtime
 from services.concurrency import BatchRerankManager, db_semaphore, single_flight
+from services.phase_logging import PhaseTrace
+from services.phase2_runtime import get_phase2_runtime
+from services.search_repository import SearchRepository
+from services.tenant_runtime import get_tenant_runtime
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 from fastapi import Depends
@@ -63,7 +66,7 @@ from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
 
 import time
-from metrics import log_metric, get_metrics
+from metrics import get_metrics, shutdown_metrics
 import redis.asyncio as redis
 
 # ===== ENV =====
@@ -75,7 +78,7 @@ if not GEMINI_API_KEY:
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 REDIS_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
 
-from infrastructure import init_infra, close_infra, redis_client, qdrant
+from infrastructure import init_infra, close_infra, redis_client
 
 class BatchRepairingException(Exception):
     def __init__(self, message: str):
@@ -108,27 +111,71 @@ async def check_cooldown(batch_id: str, topic: str, cache_type: str):
 QDRANT_COLLECTION = "document_chunks"
 CACHE_COLLECTION = "semantic_cache"
 
-# AC-22: Instantiate the Global Batch Embedding Manager
-embedding_manager = BatchEmbeddingManager(model_getter=get_embedding_model)
-# AC-25: Instantiate the Global Batch Rerank Manager for Cache Verification
-rerank_manager = BatchRerankManager(reranker_getter=get_reranker)
+# Dedicated CPU embedding runtime for online query embeddings.
+embedding_manager = get_embedding_runtime()
+search_repository = SearchRepository(QDRANT_COLLECTION)
+cache_repository = SearchRepository(CACHE_COLLECTION)
+phase2_runtime = get_phase2_runtime()
+batch_metadata_service = get_batch_metadata_service()
+rerank_manager = BatchRerankManager()
+tenant_runtime = get_tenant_runtime()
+
+async def ensure_qdrant_payload_indexes():
+    if not phase2_runtime.config.enable_qdrant_payload_indexes:
+        return
+
+    from qdrant_client.models import PayloadSchemaType
+
+    await search_repository.ensure_payload_indexes(
+        {
+            "batch_id": PayloadSchemaType.KEYWORD,
+            "chunk_id": PayloadSchemaType.KEYWORD,
+            "document_id": PayloadSchemaType.KEYWORD,
+        }
+    )
+    await cache_repository.ensure_payload_indexes(
+        {
+            "batch_id": PayloadSchemaType.KEYWORD,
+            "cache_type": PayloadSchemaType.KEYWORD,
+            "complexity": PayloadSchemaType.KEYWORD,
+            "tutor_mode": PayloadSchemaType.KEYWORD,
+        }
+    )
 
 async def initialize_qdrant():
-    """Ensures necessary Qdrant collections are ready."""
+    """
+    AC-52: Self-Healing Infrastructure Initialization.
+    Ensures Qdrant collections match the current model's dimensions.
+    """
     print("SYNC: Initializing Qdrant collections...")
-    for coll in [QDRANT_COLLECTION, CACHE_COLLECTION]:
-        try:
-            collections_res = await qdrant.get_collections()
-            exists = any(c.name == coll for c in collections_res.collections)
-            
-            if not exists:
-                print(f"SYNC: Collection {coll} not recognized. Creating fresh...")
-                await qdrant.create_collection(
-                    collection_name=coll,
-                    vectors_config={"default": VectorParams(size=768, distance=Distance.COSINE)}
-                )
-        except Exception as e:
-            print(f"WARNING: Qdrant initialization failed for {coll}: {e}")
+    
+    try:
+        # 1. Detect dimensions from the active model
+        model = get_embedding_model()
+        dims = model.hidden_size
+        print(f"SYNC: Detected Model Dimensions: {dims}")
+
+        # 2. Check and migrate Search Collection
+        is_search_valid = await search_repository.validate_collection_dimensions(dims)
+        if not is_search_valid:
+            print(f"WARNING: Dimension mismatch for '{QDRANT_COLLECTION}'. Recreating collection with size {dims}...")
+            await search_repository.recreate_collection({"default": VectorParams(size=dims, distance=Distance.COSINE)})
+        else:
+            await search_repository.ensure_collection({"default": VectorParams(size=dims, distance=Distance.COSINE)})
+
+        # 3. Check and migrate Cache Collection
+        is_cache_valid = await cache_repository.validate_collection_dimensions(dims)
+        if not is_cache_valid:
+            print(f"WARNING: Dimension mismatch for '{CACHE_COLLECTION}'. Recreating collection with size {dims}...")
+            await cache_repository.recreate_collection({"default": VectorParams(size=dims, distance=Distance.COSINE)})
+        else:
+            await cache_repository.ensure_collection({"default": VectorParams(size=dims, distance=Distance.COSINE)})
+
+    except Exception as e:
+        print(f"CRITICAL: Qdrant initialization failed: {e}")
+        traceback.print_exc()
+
+    await ensure_qdrant_payload_indexes()
 
 # --- DISTRIBUTED COORDINATOR ---
 async def start_distributed_coordinator():
@@ -205,36 +252,39 @@ async def lifespan(app: FastAPI):
         os.environ["TORCH_LOGS"] = "-ERROR"
 
         from services.bootstrap import verify_all_models
-        from services.embeddings import load_embedding_model, get_embedding_model
-        from rerank import load_reranker, get_reranker
-        
+        from services.embeddings import load_embedding_model
+
         # 1. Master Download
         print("STARTUP: Verifying all required models on disk...")
         await asyncio.to_thread(verify_all_models)
         
         # 2. Load into memory
         print("STARTUP: Loading models into RAM...")
-        load_embedding_model()
+        load_embedding_model(num_threads=embedding_manager.config.embedding_threads)
         load_whisper_model()
-        load_reranker()
         
         # 3. Deferred Warm-up (Non-blocking)
-        import threading
-        def run_warmup():
+        async def warm_embedding_runtime():
             try:
                 t_w_start = time.time()
-                print("STARTUP: Running model sanity checks (Warm-up) in background...")
-                emb_model = get_embedding_model()
-                _ = emb_model.encode(["Sanity check for BGE Embedding"])
-                
-                reranker = get_reranker()
-                # Verify adaptive logic with a small batch
-                _ = reranker.predict([("test query", "test context")] * 2)
-                print(f"STARTUP: All models warmed up successfully in {time.time() - t_w_start:.2f}s.")
+                print("STARTUP: Warming embedding runtime in background...")
+                await embedding_manager.warmup()
+                print(f"STARTUP: Embedding model warmed up successfully in {time.time() - t_w_start:.2f}s.")
             except Exception as e_warm:
                 print(f"WARNING: Background warm-up failed: {e_warm}")
 
-        threading.Thread(target=run_warmup, daemon=True).start()
+        asyncio.create_task(warm_embedding_runtime())
+
+        async def warm_phase2_runtime():
+            try:
+                t_r_start = time.time()
+                print("STARTUP: Warming Phase 2 runtime in background...")
+                await phase2_runtime.warmup()
+                print(f"STARTUP: Phase 2 runtime warmed up successfully in {time.time() - t_r_start:.2f}s.")
+            except Exception as e_warm:
+                print(f"WARNING: Phase 2 runtime warm-up failed: {e_warm}")
+
+        asyncio.create_task(warm_phase2_runtime())
         
         # --- AUTO-SYNC STARTUP (Managed by Celery Beat) ---
         print("STARTUP: Platform Sync is managed by Celery beat (2m interval).")
@@ -248,37 +298,48 @@ async def lifespan(app: FastAPI):
     await index_manager.stop_evictor()
     
     print("SHUTDOWN: Releasing all infrastructure connections...")
+    await tenant_runtime.shutdown()
+    await embedding_manager.shutdown()
+    await phase2_runtime.shutdown()
+    await batch_metadata_service.shutdown()
+    shutdown_metrics()
     await close_infra()
 
 # ===== CACHE HELPERS =====
-async def get_semantic_cache(batch_id: str, topic: str, cache_type: str, filters: Optional[Dict[str, Any]] = None):
+async def get_semantic_cache(
+    batch_id: str,
+    topic: str,
+    cache_type: str,
+    filters: Optional[Dict[str, Any]] = None,
+    embedding_context: Optional[EmbeddingRequestContext] = None,
+):
     """
     Looks up a semantically similar topic in the cache.
     Supports tiered caching via optional metadata filters (e.g. complexity).
     """
     try:
-        # AC-22: Use Batch Embedding Manager for efficient concurrent processing
-        query_vec_list = await embedding_manager.get_embedding(topic)
+        query_vec_list = await embedding_manager.get_embedding(
+            topic,
+            request_context=embedding_context,
+            priority="online",
+        )
 
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
-        
         # Build strict filters
-        must_conditions = [
-            FieldCondition(key="batch_id", match=MatchValue(value=batch_id)),
-            FieldCondition(key="cache_type", match=MatchValue(value=cache_type))
-        ]
+        exact_matches = {
+            "batch_id": batch_id,
+            "cache_type": cache_type,
+        }
         
         # Add dynamic metadata filters (e.g., complexity for chat_response)
         if filters:
             for key, val in filters.items():
-                must_conditions.append(FieldCondition(key=key, match=MatchValue(value=val)))
+                exact_matches[key] = val
 
-        cache_results = await qdrant.search(
-            collection_name=CACHE_COLLECTION,
-            query_vector=("default", query_vec_list),
-            query_filter=Filter(must=must_conditions),
+        cache_results = await cache_repository.search_by_vector(
+            query_vec_list,
+            exact_matches=exact_matches,
             limit=1,
-            score_threshold=0.96
+            score_threshold=0.96,
         )
 
         if cache_results:
@@ -303,15 +364,21 @@ async def get_semantic_cache(batch_id: str, topic: str, cache_type: str, filters
         print(f"WARNING: Cache lookup failed: {e}")
     return None
 
-async def set_semantic_cache(batch_id: str, topic: str, cache_type: str, data: Any, metadata: Optional[Dict[str, Any]] = None):
+async def set_semantic_cache(
+    batch_id: str,
+    topic: str,
+    cache_type: str,
+    data: Any,
+    metadata: Optional[Dict[str, Any]] = None,
+    embedding_context: Optional[EmbeddingRequestContext] = None,
+):
     """Saves a result to the semantic cache with optional tiered metadata."""
     try:
-        model = get_embedding_model()
-        query_vec = await asyncio.to_thread(
-            model.encode, 
-            "Represent this question for searching relevant passages: " + topic
+        query_vec_list = await embedding_manager.get_embedding(
+            topic,
+            request_context=embedding_context,
+            priority="background",
         )
-        query_vec_list = query_vec.tolist()
         
         # Build payload
         payload = {"batch_id": batch_id, "query": topic, "cache_type": cache_type}
@@ -319,14 +386,7 @@ async def set_semantic_cache(batch_id: str, topic: str, cache_type: str, data: A
             payload.update(metadata)
 
         new_point_id = str(uuid4())
-        await qdrant.upsert(
-            collection_name=CACHE_COLLECTION,
-            points=[PointStruct(
-                id=new_point_id,
-                vector={"default": query_vec_list},
-                payload=payload
-            )]
-        )
+        await cache_repository.upsert_point(new_point_id, query_vec_list, payload)
         # Cache for 24 hours
         await redis_client.setex(
             f"studio_cache:{new_point_id}",
@@ -477,50 +537,103 @@ async def create_flashcards(req: FlashcardRequest, db: AsyncSession = Depends(ge
     return await single_flight.do(flight_key, _create_flashcards_logic, req, db)
 
 async def _create_flashcards_logic(req: FlashcardRequest, db: AsyncSession):
+    trace = PhaseTrace(
+        "FLASHCARDS",
+        f"user={req.username}|batch={req.active_batch_id}|complexity={req.complexity}",
+    )
+    trace.log("Starting studio flashcard request", detail=f"topics={len(req.topics or ['general'])}")
+    enrollment_start = trace.start_phase("Enrollment Verification")
     await verify_user_enrollment(req.username, req.active_batch_id, db)
-    # This will raise BatchRepairingException if Qdrant is empty
-    await ensure_batch_is_loaded(req.active_batch_id, db)
+    trace.complete_phase("Enrollment Verification", enrollment_start)
 
-    # --- SEMANTIC CACHE LOOKUP ---
-    sorted_topics = sorted(req.topics) if req.topics else ["general"]
-    topic_str = f"{','.join(sorted_topics)} [Level: {req.complexity}]"
-    
-    await check_cooldown(req.active_batch_id, topic_str, "flashcards")
+    admission_start = trace.start_phase("Tenant Admission")
+    async with tenant_runtime.acquire(
+        req.active_batch_id,
+        lane="online",
+        feature="flashcards",
+        http_on_timeout=True,
+    ):
+        trace.complete_phase("Tenant Admission", admission_start)
+        # This will raise BatchRepairingException if Qdrant is empty
+        metadata_start = trace.start_phase("Batch Metadata Ready")
+        await ensure_batch_is_loaded(req.active_batch_id, db)
+        trace.complete_phase("Batch Metadata Ready", metadata_start)
+        embedding_context = EmbeddingRequestContext()
 
-    cached_cards = await get_semantic_cache(req.active_batch_id, topic_str, "flashcards")
-    if cached_cards:
-        db.add(Flashcard(username=req.username, batch_id=req.active_batch_id, payload=cached_cards, complexity=req.complexity))
-        await db.commit()
-        return {"cards": cached_cards}
-
-    brain_handle = index_manager.acquire(req.active_batch_id)
-    async with brain_handle as brain:
-        if not brain:
-            raise HTTPException(status_code=404, detail="Course resources not found.")
+        # --- SEMANTIC CACHE LOOKUP ---
+        sorted_topics = sorted(req.topics) if req.topics else ["general"]
+        topic_str = f"{','.join(sorted_topics)} [Level: {req.complexity}]"
         
-        bm25 = brain["bm25"]
-        graph = brain["graph"]
+        cooldown_start = trace.start_phase("Cooldown Check")
+        await check_cooldown(req.active_batch_id, topic_str, "flashcards")
+        trace.complete_phase("Cooldown Check", cooldown_start)
 
-        try:
-            cards = await generate_flashcards(
-                bm25=bm25,
-                graph=graph,
-                chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_batch_id),
-                batch_id=req.active_batch_id,
-                dense_retrieve_fn=dense_retrieve,
-                topics=req.topics,
-                complexity=req.complexity
-            )
-            if cards and len(cards) > 0:
-                db.add(Flashcard(username=req.username, batch_id=req.active_batch_id, payload=cards, complexity=req.complexity))
-                await db.commit()
-                asyncio.create_task(set_semantic_cache(req.active_batch_id, topic_str, "flashcards", cards))
-            else:
-                await set_cooldown(req.active_batch_id, topic_str, "flashcards")
-                
-            return {"cards": cards}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        cache_lookup_start = trace.start_phase("Semantic Cache Lookup")
+        cached_cards = await get_semantic_cache(
+            req.active_batch_id,
+            topic_str,
+            "flashcards",
+            embedding_context=embedding_context,
+        )
+        trace.complete_phase(
+            "Semantic Cache Lookup",
+            cache_lookup_start,
+            detail=f"cache_hit={bool(cached_cards)}",
+        )
+        if cached_cards:
+            db_save_start = trace.start_phase("DB Persist Cached Flashcards")
+            db.add(Flashcard(username=req.username, batch_id=req.active_batch_id, payload=cached_cards, complexity=req.complexity))
+            await db.commit()
+            trace.complete_phase("DB Persist Cached Flashcards", db_save_start, detail=f"cards={len(cached_cards)}")
+            trace.success(detail="returned_from_cache=True")
+            return {"cards": cached_cards}
+
+        brain_handle = index_manager.acquire(req.active_batch_id)
+        generation_start = trace.start_phase("Flashcard Generation")
+        async with brain_handle as brain:
+            if not brain:
+                raise HTTPException(status_code=404, detail="Course resources not found.")
+            
+            bm25 = brain["bm25"]
+            graph = brain["graph"]
+
+            try:
+                cards = await generate_flashcards(
+                    bm25=bm25,
+                    graph=graph,
+                    chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_batch_id),
+                    batch_id=req.active_batch_id,
+                    dense_retrieve_fn=dense_retrieve,
+                    topics=req.topics,
+                    complexity=req.complexity
+                )
+                trace.complete_phase("Flashcard Generation", generation_start, detail=f"cards={len(cards)}")
+                if cards and len(cards) > 0:
+                    db_save_start = trace.start_phase("DB Persist Flashcards")
+                    db.add(Flashcard(username=req.username, batch_id=req.active_batch_id, payload=cards, complexity=req.complexity))
+                    await db.commit()
+                    trace.complete_phase("DB Persist Flashcards", db_save_start, detail=f"cards={len(cards)}")
+                    cache_dispatch_start = trace.start_phase("Semantic Cache Save Dispatch")
+                    asyncio.create_task(
+                        set_semantic_cache(
+                            req.active_batch_id,
+                            topic_str,
+                            "flashcards",
+                            cards,
+                            embedding_context=embedding_context,
+                        )
+                    )
+                    trace.complete_phase("Semantic Cache Save Dispatch", cache_dispatch_start)
+                else:
+                    cooldown_set_start = trace.start_phase("Cooldown Set")
+                    await set_cooldown(req.active_batch_id, topic_str, "flashcards")
+                    trace.complete_phase("Cooldown Set", cooldown_set_start)
+                    
+                trace.success(detail=f"cards={len(cards)}")
+                return {"cards": cards}
+            except Exception as e:
+                trace.failure(detail=f"error={e}")
+                raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/studio/quizzes")
 async def get_quizzes(username: str, batch_id: str, db: AsyncSession = Depends(get_db)):
@@ -561,77 +674,126 @@ async def generate_quiz_endpoint(req: QuizGenerateRequest, db: AsyncSession = De
     return await single_flight.do(flight_key, _generate_quiz_logic, req, db)
 
 async def _generate_quiz_logic(req: QuizGenerateRequest, db: AsyncSession):
+    trace = PhaseTrace(
+        "QUIZ",
+        f"user={req.username}|batch={req.active_batch_id}|complexity={req.complexity}",
+    )
+    trace.log("Starting studio quiz request", detail=f"topics={len(req.topics)}")
+    enrollment_start = trace.start_phase("Enrollment Verification")
     await verify_user_enrollment(req.username, req.active_batch_id, db)
-    # Autonomic repair trigger
-    await ensure_batch_is_loaded(req.active_batch_id, db)
+    trace.complete_phase("Enrollment Verification", enrollment_start)
 
-    brain_handle = index_manager.acquire(req.active_batch_id)
-    async with brain_handle as brain:
-        if not brain:
-            raise HTTPException(status_code=404, detail="Course resources not found.")
-        
-        bm25 = brain["bm25"]
-        graph = brain["graph"]
+    admission_start = trace.start_phase("Tenant Admission")
+    async with tenant_runtime.acquire(
+        req.active_batch_id,
+        lane="online",
+        feature="quiz",
+        http_on_timeout=True,
+    ):
+        trace.complete_phase("Tenant Admission", admission_start)
+        # Autonomic repair trigger
+        metadata_start = trace.start_phase("Batch Metadata Ready")
+        await ensure_batch_is_loaded(req.active_batch_id, db)
+        trace.complete_phase("Batch Metadata Ready", metadata_start)
+        embedding_context = EmbeddingRequestContext()
 
-        results = []
-        pending_topics = []
+        brain_handle = index_manager.acquire(req.active_batch_id)
+        async with brain_handle as brain:
+            if not brain:
+                raise HTTPException(status_code=404, detail="Course resources not found.")
+            
+            bm25 = brain["bm25"]
+            graph = brain["graph"]
 
-        # 1. Granular Cache Resolution (Per-Topic)
-        for topic in req.topics:
-            topic_with_level = f"{topic} [Level: {req.complexity}]"
-            # Check cooldown per topic
-            try:
-                await check_cooldown(req.active_batch_id, topic, "quiz")
-            except HTTPException:
-                continue # Skip topics in cooldown
+            results = []
+            pending_topics = []
 
-            cached_quiz = await get_semantic_cache(req.active_batch_id, topic_with_level, "quiz")
-            if cached_quiz:
-                print(f"   [Quiz] Cache Hit for topic: '{topic}'")
-                # Save to DB for this specific user request
-                db.add(Quiz(username=req.username, batch_id=req.active_batch_id, payload=cached_quiz, complexity=req.complexity))
-                results.append(cached_quiz)
+            # 1. Granular Cache Resolution (Per-Topic)
+            cache_scan_start = trace.start_phase("Per-Topic Cache Resolution")
+            for topic in req.topics:
+                topic_with_level = f"{topic} [Level: {req.complexity}]"
+                # Check cooldown per topic
+                try:
+                    await check_cooldown(req.active_batch_id, topic, "quiz")
+                except HTTPException:
+                    continue # Skip topics in cooldown
+
+                cached_quiz = await get_semantic_cache(
+                    req.active_batch_id,
+                    topic_with_level,
+                    "quiz",
+                    embedding_context=embedding_context,
+                )
+                if cached_quiz:
+                    print(f"   [Quiz] Cache Hit for topic: '{topic}'")
+                    # Save to DB for this specific user request
+                    db.add(Quiz(username=req.username, batch_id=req.active_batch_id, payload=cached_quiz, complexity=req.complexity))
+                    results.append(cached_quiz)
+                else:
+                    pending_topics.append(topic)
+            trace.complete_phase(
+                "Per-Topic Cache Resolution",
+                cache_scan_start,
+                detail=f"cache_hits={len(results)}, misses={len(pending_topics)}",
+            )
+
+            # 2. Parallel Fan-Out for Misses
+            if pending_topics:
+                trace.log("Starting parallel topic generation", detail=f"misses={len(pending_topics)}")
+                
+                # We'll refactor the service to handle a list or call it in parallel here
+                from services.quiz import generate_quiz_for_topic
+                
+                # Internal Semaphore for LLM protection
+                sem = asyncio.Semaphore(3)
+
+                async def generate_task(topic: str):
+                    async with sem:
+                        quiz_obj = await generate_quiz_for_topic(
+                            topic=topic,
+                            bm25=bm25,
+                            graph=graph,
+                            chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_batch_id),
+                            dense_retrieve_fn=dense_retrieve,
+                            batch_id=req.active_batch_id,
+                            complexity=req.complexity
+                        )
+                        if quiz_obj:
+                            quiz_dict = quiz_obj.dict()
+                            db.add(Quiz(username=req.username, batch_id=req.active_batch_id, payload=quiz_dict, complexity=req.complexity))
+                            # Background cache save
+                            topic_level = f"{topic} [Level: {req.complexity}]"
+                            asyncio.create_task(
+                                set_semantic_cache(
+                                    req.active_batch_id,
+                                    topic_level,
+                                    "quiz",
+                                    quiz_dict,
+                                    embedding_context=embedding_context,
+                                )
+                            )
+                            return quiz_dict
+                        else:
+                            await set_cooldown(req.active_batch_id, topic, "quiz")
+                            return None
+
+                fanout_start = trace.start_phase("Parallel Quiz Generation")
+                tasks = [generate_task(t) for t in pending_topics]
+                new_quizzes = await asyncio.gather(*tasks)
+                trace.complete_phase(
+                    "Parallel Quiz Generation",
+                    fanout_start,
+                    detail=f"generated={len([q for q in new_quizzes if q is not None])}",
+                )
+                results.extend([q for q in new_quizzes if q is not None])
             else:
-                pending_topics.append(topic)
+                trace.skip_phase("Parallel Quiz Generation", detail="all_topics_served_from_cache")
 
-        # 2. Parallel Fan-Out for Misses
-        if pending_topics:
-            print(f"   [Quiz] Cache Miss for {len(pending_topics)} topics. Starting Parallel Generation...")
-            
-            # We'll refactor the service to handle a list or call it in parallel here
-            from services.quiz import generate_quiz_for_topic
-            
-            # Internal Semaphore for LLM protection
-            sem = asyncio.Semaphore(3)
-
-            async def generate_task(topic: str):
-                async with sem:
-                    quiz_obj = await generate_quiz_for_topic(
-                        topic=topic,
-                        bm25=bm25,
-                        graph=graph,
-                        chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_batch_id),
-                        dense_retrieve_fn=dense_retrieve,
-                        batch_id=req.active_batch_id,
-                        complexity=req.complexity
-                    )
-                    if quiz_obj:
-                        quiz_dict = quiz_obj.dict()
-                        db.add(Quiz(username=req.username, batch_id=req.active_batch_id, payload=quiz_dict, complexity=req.complexity))
-                        # Background cache save
-                        topic_level = f"{topic} [Level: {req.complexity}]"
-                        asyncio.create_task(set_semantic_cache(req.active_batch_id, topic_level, "quiz", quiz_dict))
-                        return quiz_dict
-                    else:
-                        await set_cooldown(req.active_batch_id, topic, "quiz")
-                        return None
-
-            tasks = [generate_task(t) for t in pending_topics]
-            new_quizzes = await asyncio.gather(*tasks)
-            results.extend([q for q in new_quizzes if q is not None])
-
-        await db.commit()
-        return {"quizzes": results}
+            db_commit_start = trace.start_phase("DB Commit")
+            await db.commit()
+            trace.complete_phase("DB Commit", db_commit_start, detail=f"quizzes={len(results)}")
+            trace.success(detail=f"quizzes={len(results)}")
+            return {"quizzes": results}
 
 class PodcastGenerateRequest(BaseModel):
     username: str
@@ -682,113 +844,178 @@ async def generate_podcast_endpoint(req: PodcastGenerateRequest, db: AsyncSessio
     return await single_flight.do(flight_key, _generate_podcast_logic, req, db)
 
 async def _generate_podcast_logic(req: PodcastGenerateRequest, db: AsyncSession):
+    trace = PhaseTrace(
+        "PODCAST",
+        f"user={req.username}|batch={req.active_batch_id}|topic={req.topic}|complexity={req.complexity}",
+    )
+    trace.log("Starting studio podcast request")
+    enrollment_start = trace.start_phase("Enrollment Verification")
     await verify_user_enrollment(req.username, req.active_batch_id, db)
-    # Autonomic repair trigger
-    await ensure_batch_is_loaded(req.active_batch_id, db)
+    trace.complete_phase("Enrollment Verification", enrollment_start)
 
-    # --- SEMANTIC CACHE LOOKUP ---
-    topic_with_level = f"{req.topic} [Level: {req.complexity}]"
-    await check_cooldown(req.active_batch_id, req.topic, "podcast")
+    admission_start = trace.start_phase("Tenant Admission")
+    async with tenant_runtime.acquire(
+        req.active_batch_id,
+        lane="online",
+        feature="podcast_request",
+        http_on_timeout=True,
+    ):
+        trace.complete_phase("Tenant Admission", admission_start)
+        # Autonomic repair trigger
+        metadata_start = trace.start_phase("Batch Metadata Ready")
+        await ensure_batch_is_loaded(req.active_batch_id, db)
+        trace.complete_phase("Batch Metadata Ready", metadata_start)
+        embedding_context = EmbeddingRequestContext()
 
-    cached_podcast = await get_semantic_cache(req.active_batch_id, topic_with_level, "podcast")
-    
-    is_cache_valid = False
-    if cached_podcast:
-        script_list = cached_podcast.get("script") if isinstance(cached_podcast, dict) else cached_podcast
-        audio_path = cached_podcast.get("audio_path") if isinstance(cached_podcast, dict) else None
+        # --- SEMANTIC CACHE LOOKUP ---
+        topic_with_level = f"{req.topic} [Level: {req.complexity}]"
+        cooldown_start = trace.start_phase("Cooldown Check")
+        await check_cooldown(req.active_batch_id, req.topic, "podcast")
+        trace.complete_phase("Cooldown Check", cooldown_start)
+
+        cache_lookup_start = trace.start_phase("Semantic Cache Lookup")
+        cached_podcast = await get_semantic_cache(
+            req.active_batch_id,
+            topic_with_level,
+            "podcast",
+            embedding_context=embedding_context,
+        )
+        trace.complete_phase(
+            "Semantic Cache Lookup",
+            cache_lookup_start,
+            detail=f"cache_hit={bool(cached_podcast)}",
+        )
         
-        if script_list and audio_path:
-            full_audio_path = PODCAST_DIR / audio_path
-            if full_audio_path.exists():
-                is_cache_valid = True
-                
-    if is_cache_valid:
-        script_list = cached_podcast.get("script") if isinstance(cached_podcast, dict) else cached_podcast
-        audio_path = cached_podcast.get("audio_path") if isinstance(cached_podcast, dict) else None
-        
-        db.add(Podcast(
-            username=req.username, 
-            batch_id=req.active_batch_id, 
-            filename=audio_path, 
-            transcript=json.dumps(script_list), 
-            topic=req.topic, 
-            complexity=req.complexity
-        ))
+        is_cache_valid = False
+        cache_validate_start = trace.start_phase("Cached Audio Validation")
+        if cached_podcast:
+            script_list = cached_podcast.get("script") if isinstance(cached_podcast, dict) else cached_podcast
+            audio_path = cached_podcast.get("audio_path") if isinstance(cached_podcast, dict) else None
+            
+            if script_list and audio_path:
+                full_audio_path = PODCAST_DIR / audio_path
+                if full_audio_path.exists():
+                    is_cache_valid = True
+        trace.complete_phase("Cached Audio Validation", cache_validate_start, detail=f"cache_valid={is_cache_valid}")
+                    
+        if is_cache_valid:
+            script_list = cached_podcast.get("script") if isinstance(cached_podcast, dict) else cached_podcast
+            audio_path = cached_podcast.get("audio_path") if isinstance(cached_podcast, dict) else None
+            
+            db_save_start = trace.start_phase("DB Persist Cached Podcast")
+            db.add(Podcast(
+                username=req.username, 
+                batch_id=req.active_batch_id, 
+                filename=audio_path, 
+                transcript=json.dumps(script_list), 
+                topic=req.topic, 
+                complexity=req.complexity
+            ))
+            await db.commit()
+            trace.complete_phase("DB Persist Cached Podcast", db_save_start, detail=f"audio_path={audio_path}")
+            trace.success(detail="returned_from_cache=True")
+            return JobResponse(job_id="cached", status=JobStatus.COMPLETED, filename=req.topic)
+
+        # Dispatch to Celery
+        dispatch_start = trace.start_phase("Podcast Job Dispatch")
+        job_id = f"podcast_{uuid4().hex[:8]}"
+        new_job = IngestionJob(id=job_id, status=JobStatus.PROCESSING.value, filename=f"Podcast: {req.topic}")
+        db.add(new_job)
         await db.commit()
-        return JobResponse(job_id="cached", status=JobStatus.COMPLETED, filename=req.topic)
 
-    # Dispatch to Celery
-    job_id = f"podcast_{uuid4().hex[:8]}"
-    new_job = IngestionJob(id=job_id, status=JobStatus.PROCESSING.value, filename=f"Podcast: {req.topic}")
-    db.add(new_job)
-    await db.commit()
+        celery_app.send_task("generate_podcast_task", args=[
+            job_id, req.username, req.active_batch_id, req.topic, req.complexity
+        ])
+        trace.complete_phase("Podcast Job Dispatch", dispatch_start, detail=f"job_id={job_id}")
+        trace.success(detail=f"job_id={job_id}")
 
-    celery_app.send_task("generate_podcast_task", args=[
-        job_id, req.username, req.active_batch_id, req.topic, req.complexity
-    ])
-
-    return JobResponse(job_id=job_id, status=JobStatus.PROCESSING, filename=req.topic)
+        return JobResponse(job_id=job_id, status=JobStatus.PROCESSING, filename=req.topic)
 
 async def generate_podcast_background(job_id: str, username: str, batch_id: str, topic: str, complexity: str):
+    trace = PhaseTrace(
+        "PODCAST-BG",
+        f"job={job_id}|user={username}|batch={batch_id}|topic={topic}|complexity={complexity}",
+    )
+    trace.log("Starting background podcast generation")
     try:
-        # 1. Ensure metadata is ready
-        async with AsyncSessionLocal() as db:
-            if not await ensure_batch_is_loaded(batch_id, db):
-                 raise RuntimeError("Batch metadata not ready.")
+        embedding_context = EmbeddingRequestContext()
+        admission_start = trace.start_phase("Tenant Admission")
+        async with tenant_runtime.acquire(batch_id, lane="background", feature="podcast_background"):
+            trace.complete_phase("Tenant Admission", admission_start)
+            # 1. Ensure metadata is ready
+            metadata_start = trace.start_phase("Batch Metadata Ready")
+            async with AsyncSessionLocal() as db:
+                if not await ensure_batch_is_loaded(batch_id, db):
+                     raise RuntimeError("Batch metadata not ready.")
+            trace.complete_phase("Batch Metadata Ready", metadata_start)
 
-        # 2. Fetch Metadata (RAM Lifecycle Lease)
-        brain_handle = index_manager.acquire(batch_id)
-        async with brain_handle as brain:
-            if not brain: raise RuntimeError("Course resources not found.")
+            # 2. Fetch Metadata (RAM Lifecycle Lease)
+            generation_start = trace.start_phase("Podcast Generation")
+            brain_handle = index_manager.acquire(batch_id)
+            async with brain_handle as brain:
+                if not brain: raise RuntimeError("Course resources not found.")
+                
+                bm25 = brain["bm25"]
+                graph = brain["graph"]
+
+                podcast = await generate_podcast(
+                    topic=topic,
+                    bm25=bm25,
+                    graph=graph,
+                    chunk_fetcher=lambda ids: fetch_chunk_details(ids, batch_id),
+                    dense_retrieve_fn=dense_retrieve,
+                    batch_id=batch_id,
+                    complexity=complexity
+                )
+            trace.complete_phase("Podcast Generation", generation_start, detail=f"audio_ready={bool(podcast and podcast.audio_path)}")
             
-            bm25 = brain["bm25"]
-            graph = brain["graph"]
+            if not podcast:
+                raise RuntimeError("Not enough resource to generate podcast")
 
-            podcast = await generate_podcast(
-                topic=topic,
-                bm25=bm25,
-                graph=graph,
-                chunk_fetcher=lambda ids: fetch_chunk_details(ids, batch_id),
-                dense_retrieve_fn=dense_retrieve,
-                batch_id=batch_id,
-                complexity=complexity
+            script_list = [s.dict() for s in podcast.script]
+            
+            # 3. Save to DB
+            db_save_start = trace.start_phase("DB Persist Podcast")
+            async with AsyncSessionLocal() as db:
+                db.add(Podcast(
+                    username=username, 
+                    batch_id=batch_id, 
+                    filename=podcast.audio_path, 
+                    transcript=json.dumps(script_list), 
+                    topic=topic, 
+                    complexity=complexity
+                ))
+                
+                # Update Job
+                job_result = await db.execute(select(IngestionJob).where(IngestionJob.id == job_id))
+                job = job_result.scalars().first()
+                if job:
+                    job.status = JobStatus.COMPLETED
+                    job.message = "Success"
+                
+                await db.commit()
+            trace.complete_phase("DB Persist Podcast", db_save_start, detail=f"segments={len(script_list)}")
+
+            # 4. Cache
+            topic_with_level = f"{topic} [Level: {complexity}]"
+            cache_save_start = trace.start_phase("Semantic Cache Save")
+            await set_semantic_cache(
+                batch_id,
+                topic_with_level,
+                "podcast",
+                {
+                    "audio_path": podcast.audio_path,
+                    "script": script_list,
+                    "topic": topic,
+                    "duration_seconds": podcast.duration_seconds,
+                },
+                embedding_context=embedding_context,
             )
-        
-        if not podcast:
-            raise RuntimeError("Not enough resource to generate podcast")
-
-        script_list = [s.dict() for s in podcast.script]
-        
-        # 3. Save to DB
-        async with AsyncSessionLocal() as db:
-            db.add(Podcast(
-                username=username, 
-                batch_id=batch_id, 
-                filename=podcast.audio_path, 
-                transcript=json.dumps(script_list), 
-                topic=topic, 
-                complexity=complexity
-            ))
-            
-            # Update Job
-            job_result = await db.execute(select(IngestionJob).where(IngestionJob.id == job_id))
-            job = job_result.scalars().first()
-            if job:
-                job.status = JobStatus.COMPLETED
-                job.message = "Success"
-            
-            await db.commit()
-
-        # 4. Cache
-        topic_with_level = f"{topic} [Level: {complexity}]"
-        await set_semantic_cache(batch_id, topic_with_level, "podcast", {
-            "audio_path": podcast.audio_path,
-            "script": script_list,
-            "topic": topic,
-            "duration_seconds": podcast.duration_seconds
-        })
+            trace.complete_phase("Semantic Cache Save", cache_save_start)
+            trace.success(detail=f"job_id={job_id}")
 
     except PodcastRefusalError as pre:
+        trace.failure(detail=f"podcast_refusal={pre}")
         # AC-45: Security Gate refusal / No Info Found
         # Set a 3min cooldown to prevent spamming the same invalid topic
         await set_cooldown(batch_id, topic, "podcast")
@@ -801,6 +1028,7 @@ async def generate_podcast_background(job_id: str, username: str, batch_id: str,
                 await db.commit()
 
     except ValueError as ve:
+        trace.failure(detail=f"value_error={ve}")
         # AC-45: Security Gate refusal / No Info Found
         # Set a 3min cooldown to prevent spamming the same invalid topic
         await set_cooldown(batch_id, topic, "podcast")
@@ -813,6 +1041,7 @@ async def generate_podcast_background(job_id: str, username: str, batch_id: str,
                 await db.commit()
 
     except Exception as e:
+        trace.failure(detail=f"error={e}")
         traceback.print_exc()
         async with AsyncSessionLocal() as db:
             job_result = await db.execute(select(IngestionJob).where(IngestionJob.id == job_id))
@@ -883,37 +1112,10 @@ async def delete_podcast(username: str, batch_id: str, topic: str, db: AsyncSess
     return {"status": "success"}
 # ===== SOURCES MANAGEMENT =====
 async def list_sources(batch_id: Optional[str] = None):
-    all_stored = []
     try:
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
-        
-        scroll_filter = None
-        if batch_id:
-            scroll_filter = Filter(
-                must=[FieldCondition(key="batch_id", match=MatchValue(value=batch_id))]
-            )
-
-        response = await qdrant.scroll(
-            collection_name=QDRANT_COLLECTION, 
-            scroll_filter=scroll_filter,
-            limit=100, 
-            with_payload=True
-        )
-        points, _ = response
-        seen = {}
-        for p in points:
-            doc_id = p.payload.get("document_id")
-            if doc_id and doc_id not in seen:
-                seen[doc_id] = {
-                    "document_id": doc_id,
-                    "filename": p.payload.get("metadata", {}).get("filename", "Unknown"),
-                    "type": p.payload.get("type", "persistent"),
-                    "is_active": True, # In stateless mode, if it's in Qdrant, it's available
-                    "ingested_at": p.payload.get("metadata", {}).get("ingested_at")
-                }
-        all_stored = list(seen.values())
-    except Exception: pass
-    return {"sources": all_stored}
+        return {"sources": await search_repository.list_documents(batch_id=batch_id, limit=100)}
+    except Exception:
+        return {"sources": []}
 
 @app.get("/sources")
 async def list_sources_endpoint(batch_id: Optional[str] = None):
@@ -937,27 +1139,14 @@ async def deactivate_sources(req: ActivateRequest):
 async def delete_source(document_id: str, db: AsyncSession = Depends(get_db)):
     print(f"DEBUG: Deleting source {document_id}")
     try:
-        # 1. Fetch metadata for physical deletion
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
-        response = await qdrant.scroll(
-            collection_name=QDRANT_COLLECTION,
-            scroll_filter=Filter(must=[FieldCondition(key="document_id", match=MatchValue(value=document_id))]),
-            limit=1,
-            with_payload=True
-        )
-        points = response[0]
-        if not points:
+        doc_payload = await search_repository.get_document_payload(document_id)
+        if not doc_payload:
             raise HTTPException(status_code=404, detail="Source not found")
-        
-        doc_payload = points[0].payload
+
         batch_id = doc_payload.get("batch_id") or doc_payload.get("metadata", {}).get("batch_id")
         filename = doc_payload.get("metadata", {}).get("filename")
 
-        # 2. Remove from Qdrant
-        await qdrant.delete(
-            collection_name=QDRANT_COLLECTION, 
-            points_selector=Filter(must=[FieldCondition(key="document_id", match=MatchValue(value=document_id))])
-        )
+        await search_repository.delete_payloads(exact_matches={"document_id": document_id})
         
         # 3. Physical File Deletion
         if batch_id and filename:
@@ -967,16 +1156,12 @@ async def delete_source(document_id: str, db: AsyncSession = Depends(get_db)):
                     target_file.unlink()
                 except: pass
 
-        # 4. Invalidate Metadata in DB so it's re-built next time
         if batch_id:
-            result = await db.execute(select(Batch).where(Batch.id == batch_id))
-            batch = result.scalars().first()
-            if batch:
-                batch.bm25_data = None
-                batch.graph_data = None
-                await db.commit()
+            await batch_metadata_service.rebuild_batch_metadata(batch_id, force=True)
             
         return {"status": "success"}
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"ERROR: Failed to delete source {document_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -984,13 +1169,16 @@ async def delete_source(document_id: str, db: AsyncSession = Depends(get_db)):
 @app.delete("/sources")
 async def clear_all_sources(db: AsyncSession = Depends(get_db)):
     try:
-        await qdrant.delete_collection(QDRANT_COLLECTION)
-        await qdrant.create_collection(collection_name=QDRANT_COLLECTION, vectors_config={"default": VectorParams(size=768, distance=Distance.COSINE)})
+        model = get_embedding_model()
+        dims = model.hidden_size
+        await search_repository.recreate_collection({"default": VectorParams(size=dims, distance=Distance.COSINE)})
+        await ensure_qdrant_payload_indexes()
         
         # Wipe all batch metadata
         from sqlalchemy import update
         await db.execute(update(Batch).values(bm25_data=None, graph_data=None))
         await db.commit()
+        await index_manager.clear_all()
         
         return {"status": "success"}
     except Exception as e:
@@ -1009,45 +1197,25 @@ def get_whisper_model():
         load_whisper_model()
     return _whisper_model
 
-async def dense_retrieve(query: str, batch_id: str, top_k: int = 50) -> dict:
-    # AC-22: Use Batch Embedding Manager for efficient concurrent processing
-    query_vec = await embedding_manager.get_embedding(query)
-    
-    from qdrant_client.models import Filter, FieldCondition, MatchValue
-    results = await qdrant.search(
-        collection_name=QDRANT_COLLECTION, 
-        query_vector=("default", query_vec), 
-        query_filter=Filter(must=[FieldCondition(key="batch_id", match=MatchValue(value=batch_id))]), 
-        limit=top_k, 
-        with_payload=True
+async def dense_retrieve(
+    query: str,
+    batch_id: str,
+    top_k: int = 50,
+    embedding_context: Optional[EmbeddingRequestContext] = None,
+) -> dict:
+    query_vec = await embedding_manager.get_embedding(
+        query,
+        request_context=embedding_context,
+        priority="online",
     )
-    return {p.payload["chunk_id"]: float(p.score) for p in results if "chunk_id" in p.payload}
+    return await search_repository.dense_search(query_vec, batch_id=batch_id, top_k=top_k)
 
 async def fetch_chunk_details(chunk_ids: List[str], batch_id: str = None) -> List[Dict]:
     """
     Helper to fetch full chunk data from Qdrant by IDs.
     AC-20: Security Hard-Lock - Always filter by batch_id to prevent cross-tenant data leakage.
     """
-    if not chunk_ids:
-        return []
-    
-    from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue
-    
-    # Base filter: match any of the requested chunk IDs
-    must_conditions = [FieldCondition(key="chunk_id", match=MatchAny(any=chunk_ids))]
-    
-    # Security Gate: If batch_id is provided, enforce it strictly
-    if batch_id:
-        must_conditions.append(FieldCondition(key="batch_id", match=MatchValue(value=batch_id)))
-
-    response = await qdrant.scroll(
-        collection_name=QDRANT_COLLECTION,
-        scroll_filter=Filter(must=must_conditions),
-        limit=len(chunk_ids),
-        with_payload=True
-    )
-    points, _ = response
-    return [p.payload for p in points]
+    return await search_repository.fetch_chunk_details(chunk_ids, batch_id=batch_id)
 
 async def verify_user_enrollment(username: str, batch_id: str, db: AsyncSession):
     """
@@ -1081,67 +1249,12 @@ async def ensure_batch_is_loaded(batch_id: str, db: AsyncSession):
     Coalesces identical concurrent loads via Single-Flight.
     """
     flight_key = f"load_batch:{batch_id}"
-    return await single_flight.do(flight_key, _ensure_batch_logic, batch_id, db)
+    return await single_flight.do(flight_key, _ensure_batch_logic, batch_id)
 
-async def _ensure_batch_logic(batch_id: str, db: AsyncSession):
-    # AC-26: Database Guard
-    async with db_semaphore:
-        result = await db.execute(select(Batch).where(Batch.id == batch_id))
-        batch = result.scalars().first()
-    
-    if not batch or not batch.bm25_data or not batch.graph_data:
-        print(f"INFO: Batch {batch_id} metadata missing. Building from Qdrant...")
-        # 1. Scroll all chunks for this batch
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
-        response = await qdrant.scroll(
-            collection_name=QDRANT_COLLECTION,
-            scroll_filter=Filter(must=[FieldCondition(key="batch_id", match=MatchValue(value=batch_id))]),
-            limit=10000,
-            with_payload=True
-        )
-        points, _ = response
-        
-        if not points:
-            print(f"WARN: No data found in Qdrant for batch {batch_id}. Triggering LAZY REPAIR (Deletion).")
-            # AC-100: Lazy Deletion Trigger
-            # Instead of firing a manual ingestion, we delete the local records.
-            # The next 2-min sync cycle will see these as 'new' and re-ingest correctly.
-            
-            async with db_semaphore:
-                # 1. Delete from Postgres
-                await db.execute(delete(Batch).where(Batch.id == batch_id))
-                await db.execute(delete(UserEnrollment).where(UserEnrollment.batch_id == batch_id))
-                await db.commit()
-            
-            # 2. Delete from SQLite Sync DB (Processed Files)
-            from services.platform_sync import PlatformSyncService
-            sync_service = PlatformSyncService()
-            sync_service.remove_all_files_for_batch(batch_id)
-            
-            raise BatchRepairingException("Preparing course materials for your session. Please try again in 60 seconds.")
-
-        chunks = [p.payload for p in points]
-        
-        # 2. Build Index and Graph (Offloaded to separate thread)
-        new_bm25 = await asyncio.to_thread(BM25ChunkIndex, chunks)
-        new_graph = await asyncio.to_thread(build_chunk_graph, chunks)
-        
-        # 3. Save to DB
-        # Offload CPU-bound dictionary conversion
-        bm25_dict = await asyncio.to_thread(new_bm25.to_dict)
-        
-        if not batch:
-            batch = Batch(id=batch_id, name=f"Course {batch_id}")
-            db.add(batch)
-        
-        batch.bm25_data = bm25_dict
-        batch.graph_data = new_graph
-        batch.integrity_status = "HEALTHY"
-        await db.commit()
-        
-        print(f"SUCCESS: Built and persisted stateless metadata for batch {batch_id}.")
-        return True
-    
+async def _ensure_batch_logic(batch_id: str):
+    is_ready = await batch_metadata_service.ensure_batch_metadata(batch_id)
+    if not is_ready:
+        raise BatchRepairingException("Preparing course materials for your session. Please try again in 60 seconds.")
     return True
 
 # ===== API MODELS =====
@@ -1154,10 +1267,11 @@ class SwitchBatchRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     username: str
-    active_batch_id: str
+    active_batch_id: Optional[str] = None
     message: str = Field(..., min_length=1)
     complexity: str = Field("Undergrad", description="Complexity level: 5-Year-Old, High School, Undergrad, PhD Expert")
     tutor_mode: bool = Field(False, description="Enable Socratic Tutor mode")
+    bypass_rag: bool = Field(False, description="Bypass RAG pipeline and send query directly to LLM")
     min_dense_score: float = Field(0.30, description="Strategy 2: Early Thresholding for dense matches")
 
 COMPLEXITY_MAP = {
@@ -1209,190 +1323,155 @@ class BatchUrlRequest(BaseModel):
 # ===== BACKGROUND WORKER & INGESTION =====
 async def process_ingestion_background(job_id: str, input_path: str, file_type: str, ingestion_id: str, file_id: str, filename: str, batch_id: str, mode: str = "single"):
     try:
-        from urllib.parse import urlparse
-        import httpx
-        
-        # 1. SMART ROUTING FOR AUTO-URLS
-        t_start = time.time()
-        print(f"\n[INGESTION PHASE 1/6] Smart Routing & Download: {input_path}")
-        if file_type == "url_auto":
-            if "youtube.com" in input_path or "youtu.be" in input_path:
-                file_type = "youtube"
-            else:
-                try:
-                    async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
-                        resp = await client.head(input_path)
-                        ct = resp.headers.get("Content-Type", "").lower()
-                        if "application/pdf" in ct: file_type = ".pdf"
-                        elif "application/vnd.openxmlformats-officedocument.presentationml.presentation" in ct: file_type = ".pptx"
-                        elif "video/" in ct: file_type = ".mp4"
-                        elif "text/html" in ct: file_type = "web"
-                        else:
-                            pure_path = urlparse(input_path).path.lower()
-                            if pure_path.endswith(".pdf"): file_type = ".pdf"
-                            elif pure_path.endswith((".pptx", ".ppt")): file_type = ".pptx"
-                            elif pure_path.endswith((".mp4", ".mkv")): file_type = ".mp4"
-                            elif pure_path.endswith((".xlsx", ".xls")): file_type = ".xlsx"
-                            else: file_type = "web"
-                except: file_type = "web"
-
-            if file_type not in ["youtube", "web"]:
-                async with AsyncSessionLocal() as db:
-                    job_result = await db.execute(select(IngestionJob).where(IngestionJob.id == job_id))
-                    job = job_result.scalars().first()
-                    if job:
-                        job.message = f"Downloading {file_type}..."
-                        await db.commit()
-                
-                from urllib.parse import unquote
-                url_filename = Path(urlparse(input_path).path).name or f"remote_file{file_type}"
-                
-                # BATCH ISOLATION: Nest file in batch directory
-                batch_dir = UPLOAD_DIR / batch_id
-                batch_dir.mkdir(parents=True, exist_ok=True)
-                
-                local_file = batch_dir / f"{file_id}_{uuid4().hex[:6]}_{unquote(url_filename)}"
-                async with httpx.AsyncClient(follow_redirects=True) as client:
-                    download_resp = await client.get(input_path)
-                    download_resp.raise_for_status()
-                    with open(local_file, "wb") as f: f.write(download_resp.content)
-                input_path = str(local_file)
-        t_routing = time.time()
-        print(f"   -> Phase 1 Completed in {t_routing - t_start:.2f}s (Total: {t_routing - t_start:.2f}s)")
-
-        print(f"[INGESTION PHASE 2/6] Extraction ({file_type})")
-        blocks = []
-        model_name = "Unknown"
-        
-        if file_type == "youtube":
-            blocks = await asyncio.to_thread(ingest_youtube_video, input_path, file_id, model=get_whisper_model())
-            model_name = "WhisperX"
-        elif file_type == ".pdf":
-            blocks = await asyncio.to_thread(ingest_pdf_layout_aware, Path(input_path), file_id)
-            model_name = "PDF"
-        elif file_type in [".pptx", ".ppt"]:
-            blocks = await asyncio.to_thread(ingest_pptx_structure_aware, Path(input_path), file_id)
-            model_name = "PPTX"
-        elif file_type in [".xlsx", ".xls"]:
-            blocks = await asyncio.to_thread(ingest_excel, Path(input_path), file_id)
-            model_name = "Excel"
-        elif file_type in [".mp4", ".mkv", ".mov"]:
-            blocks = await asyncio.to_thread(ingest_video_file, Path(input_path), file_id, model=get_whisper_model())
-            model_name = "WhisperX"
-        elif file_type == "web":
-            ingestor = WebIngestor()
-            if mode == "crawl": raw_blocks = await asyncio.to_thread(ingestor.crawl, input_path)
-            elif mode == "sitemap": raw_blocks = await asyncio.to_thread(ingestor.ingest_sitemap, input_path)
-            else: raw_blocks = await asyncio.to_thread(ingestor.ingest, input_path)
-            model_name = "Web"
-            blocks = [{"block_id": rb.block_id, "block_type": rb.block_type, "text": rb.text, "document_id": file_id, "page": 1, "metadata": {**rb.metadata}} for rb in raw_blocks if rb.block_type != "error"]
-        
-        for b in blocks:
-            b["batch_id"] = batch_id
-            if "metadata" not in b: b["metadata"] = {}
-            b["metadata"]["batch_id"] = batch_id
-            b["metadata"]["filename"] = filename
-            b["metadata"]["ingested_at"] = int(time.time())
-        t_extraction = time.time()
-        print(f"   -> Phase 2 Completed in {t_extraction - t_routing:.2f}s (Blocks: {len(blocks)}, Total: {t_extraction - t_start:.2f}s)")
-
-        print(f"[INGESTION PHASE 3/6] Semantic Chunking")
-        if blocks and blocks[0].get("is_prechunked"): chunks = blocks
-        else: chunks = await asyncio.to_thread(semantic_chunk_blocks, blocks)
-        
-        for c in chunks:
-            c["batch_id"] = batch_id
-            if "metadata" not in c: c["metadata"] = {}
-            c["metadata"]["batch_id"] = batch_id
-            c["metadata"]["filename"] = filename
-            c["metadata"]["ingested_at"] = int(time.time())
-        t_chunking = time.time()
-        print(f"   -> Phase 3 Completed in {t_chunking - t_extraction:.2f}s (Chunks: {len(chunks)}, Total: {t_chunking - t_start:.2f}s)")
-
-        # Filter chunks that are eligible for embedding
-        eligible_chunks = [c for c in chunks if c.get("embedding_eligible") and c.get("text")]
-        texts = [c["text"] for c in eligible_chunks]
-        
-        print(f"[INGESTION PHASE 4/6] Embedding Generation")
-        if texts:
-            # Safety: Ensure collection exists before upsert
-            collections = await qdrant.get_collections()
-            if not any(c.name == QDRANT_COLLECTION for c in collections.collections):
-                await qdrant.create_collection(
-                    collection_name=QDRANT_COLLECTION,
-                    vectors_config={"default": VectorParams(size=768, distance=Distance.COSINE)}
-                )
-
-            model = get_embedding_model()
-            # Use to_thread for CPU bound embedding generation
-            vectors = await asyncio.to_thread(model.encode, texts, batch_size=32)
-            t_embedding = time.time()
-            print(f"   -> Phase 4 Completed in {t_embedding - t_chunking:.2f}s (Embeddings: {len(texts)}, Total: {t_embedding - t_start:.2f}s)")
-
-            print(f"[INGESTION PHASE 5/6] Vector Store Upsert")
-            points = []
-            for i, vec in enumerate(vectors):
-                points.append(PointStruct(
-                    id=int(uuid4().int >> 64), 
-                    vector={"default": vec.tolist()}, 
-                    payload=eligible_chunks[i]
-                ))
-            await qdrant.upsert(QDRANT_COLLECTION, points)
-            t_upsert = time.time()
-            print(f"   -> Phase 5 Completed in {t_upsert - t_embedding:.2f}s (Total: {t_upsert - t_start:.2f}s)")
-        else:
-            t_upsert = time.time()
-            print(f"   -> Phase 4 & 5 Skipped (No eligible text, Total: {t_upsert - t_start:.2f}s)")
+        async with tenant_runtime.acquire(batch_id, lane="background", feature="ingestion_background"):
+            from urllib.parse import urlparse
+            import httpx
             
-        # STATELESS TRANSITION: Re-build and Persist Metadata to Postgres
-        # We fetch ALL chunks for this batch to ensure the BM25/Graph is complete
-        print(f"[INGESTION PHASE 6/6] Metadata & Index Building")
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
-        response = await qdrant.scroll(
-            collection_name=QDRANT_COLLECTION,
-            scroll_filter=Filter(must=[FieldCondition(key="batch_id", match=MatchValue(value=batch_id))]),
-            limit=10000,
-            with_payload=True
-        )
-        all_batch_points = response[0]
-        all_batch_chunks = [p.payload for p in all_batch_points]
-        
-        async with AsyncSessionLocal() as db:
-            if all_batch_chunks:
-                new_bm25 = await asyncio.to_thread(BM25ChunkIndex, all_batch_chunks)
-                new_graph = await asyncio.to_thread(build_chunk_graph, all_batch_chunks)
+            # 1. SMART ROUTING FOR AUTO-URLS
+            t_start = time.time()
+            print(f"\n[INGESTION PHASE 1/6] Smart Routing & Download: {input_path}")
+            if file_type == "url_auto":
+                if "youtube.com" in input_path or "youtu.be" in input_path:
+                    file_type = "youtube"
+                else:
+                    try:
+                        async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+                            resp = await client.head(input_path)
+                            ct = resp.headers.get("Content-Type", "").lower()
+                            if "application/pdf" in ct: file_type = ".pdf"
+                            elif "application/vnd.openxmlformats-officedocument.presentationml.presentation" in ct: file_type = ".pptx"
+                            elif "video/" in ct: file_type = ".mp4"
+                            elif "text/html" in ct: file_type = "web"
+                            else:
+                                pure_path = urlparse(input_path).path.lower()
+                                if pure_path.endswith(".pdf"): file_type = ".pdf"
+                                elif pure_path.endswith((".pptx", ".ppt")): file_type = ".pptx"
+                                elif pure_path.endswith((".mp4", ".mkv")): file_type = ".mp4"
+                                elif pure_path.endswith((".xlsx", ".xls")): file_type = ".xlsx"
+                                else: file_type = "web"
+                    except: file_type = "web"
+
+                if file_type not in ["youtube", "web"]:
+                    async with AsyncSessionLocal() as db:
+                        job_result = await db.execute(select(IngestionJob).where(IngestionJob.id == job_id))
+                        job = job_result.scalars().first()
+                        if job:
+                            job.message = f"Downloading {file_type}..."
+                            await db.commit()
+                    
+                    from urllib.parse import unquote
+                    url_filename = Path(urlparse(input_path).path).name or f"remote_file{file_type}"
+                    
+                    # BATCH ISOLATION: Nest file in batch directory
+                    batch_dir = UPLOAD_DIR / batch_id
+                    batch_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    local_file = batch_dir / f"{file_id}_{uuid4().hex[:6]}_{unquote(url_filename)}"
+                    async with httpx.AsyncClient(follow_redirects=True) as client:
+                        download_resp = await client.get(input_path)
+                        download_resp.raise_for_status()
+                        with open(local_file, "wb") as f: f.write(download_resp.content)
+                    input_path = str(local_file)
+            t_routing = time.time()
+            print(f"   -> Phase 1 Completed in {t_routing - t_start:.2f}s (Total: {t_routing - t_start:.2f}s)")
+
+            print(f"[INGESTION PHASE 2/6] Extraction ({file_type})")
+            blocks = []
+            model_name = "Unknown"
+            
+            if file_type == "youtube":
+                blocks = await asyncio.to_thread(ingest_youtube_video, input_path, file_id, model=get_whisper_model())
+                model_name = "WhisperX"
+            elif file_type == ".pdf":
+                blocks = await asyncio.to_thread(ingest_pdf_layout_aware, Path(input_path), file_id)
+                model_name = "PDF"
+            elif file_type in [".pptx", ".ppt"]:
+                blocks = await asyncio.to_thread(ingest_pptx_structure_aware, Path(input_path), file_id)
+                model_name = "PPTX"
+            elif file_type in [".xlsx", ".xls"]:
+                blocks = await asyncio.to_thread(ingest_excel, Path(input_path), file_id)
+                model_name = "Excel"
+            elif file_type in [".mp4", ".mkv", ".mov"]:
+                blocks = await asyncio.to_thread(ingest_video_file, Path(input_path), file_id, model=get_whisper_model())
+                model_name = "WhisperX"
+            elif file_type == "web":
+                ingestor = WebIngestor()
+                if mode == "crawl": raw_blocks = await asyncio.to_thread(ingestor.crawl, input_path)
+                elif mode == "sitemap": raw_blocks = await asyncio.to_thread(ingestor.ingest_sitemap, input_path)
+                else: raw_blocks = await asyncio.to_thread(ingestor.ingest, input_path)
+                model_name = "Web"
+                blocks = [{"block_id": rb.block_id, "block_type": rb.block_type, "text": rb.text, "document_id": file_id, "page": 1, "metadata": {**rb.metadata}} for rb in raw_blocks if rb.block_type != "error"]
+            
+            for b in blocks:
+                b["batch_id"] = batch_id
+                if "metadata" not in b: b["metadata"] = {}
+                b["metadata"]["batch_id"] = batch_id
+                b["metadata"]["filename"] = filename
+                b["metadata"]["ingested_at"] = int(time.time())
+            t_extraction = time.time()
+            print(f"   -> Phase 2 Completed in {t_extraction - t_routing:.2f}s (Blocks: {len(blocks)}, Total: {t_extraction - t_start:.2f}s)")
+
+            print(f"[INGESTION PHASE 3/6] Semantic Chunking")
+            if blocks and blocks[0].get("is_prechunked"): chunks = blocks
+            else: chunks = await asyncio.to_thread(semantic_chunk_blocks, blocks)
+            
+            for c in chunks:
+                c["batch_id"] = batch_id
+                if "metadata" not in c: c["metadata"] = {}
+                c["metadata"]["batch_id"] = batch_id
+                c["metadata"]["filename"] = filename
+                c["metadata"]["ingested_at"] = int(time.time())
+            t_chunking = time.time()
+            print(f"   -> Phase 3 Completed in {t_chunking - t_extraction:.2f}s (Chunks: {len(chunks)}, Total: {t_chunking - t_start:.2f}s)")
+
+            # Filter chunks that are eligible for embedding
+            eligible_chunks = [c for c in chunks if c.get("embedding_eligible") and c.get("text")]
+            texts = [c["text"] for c in eligible_chunks]
+            
+            print(f"[INGESTION PHASE 4/6] Embedding Generation")
+            if texts:
+                model = get_embedding_model()
+                await search_repository.ensure_collection({"default": VectorParams(size=model.hidden_size, distance=Distance.COSINE)})
+                await ensure_qdrant_payload_indexes()
+
+                # Use to_thread for CPU bound embedding generation
+                vectors = await asyncio.to_thread(model.encode, texts, batch_size=32)
+                t_embedding = time.time()
+                print(f"   -> Phase 4 Completed in {t_embedding - t_chunking:.2f}s (Embeddings: {len(texts)}, Total: {t_embedding - t_start:.2f}s)")
+
+                print(f"[INGESTION PHASE 5/6] Vector Store Upsert")
+                points = []
+                for i, vec in enumerate(vectors):
+                    points.append(PointStruct(
+                        id=int(uuid4().int >> 64), 
+                        vector={"default": vec.tolist()}, 
+                        payload=eligible_chunks[i]
+                    ))
+                await search_repository.upsert_points(points)
+                t_upsert = time.time()
+                print(f"   -> Phase 5 Completed in {t_upsert - t_embedding:.2f}s (Total: {t_upsert - t_start:.2f}s)")
+            else:
+                t_upsert = time.time()
+                print(f"   -> Phase 4 & 5 Skipped (No eligible text, Total: {t_upsert - t_start:.2f}s)")
                 
-                # CPU-Bound Serialization: Offload to thread
-                bm25_dict = await asyncio.to_thread(new_bm25.to_dict)
-                
-                result = await db.execute(select(Batch).where(Batch.id == batch_id))
-                batch = result.scalars().first()
-                if not batch:
-                    batch = Batch(id=batch_id, name=f"Course {batch_id}")
-                    db.add(batch)
-                
-                batch.bm25_data = bm25_dict
-                batch.graph_data = new_graph
-                batch.integrity_status = "HEALTHY"
-                await db.commit()
-                
-                # IMS INVALIDATION: Clear RAM singleton so next request loads fresh data
-                await index_manager.invalidate_batch(batch_id)
-                
-                # CACHE INVALIDATION: Clear Redis so chat uses the new index
-                await redis_client.delete(f"batch_meta:{batch_id}")
-                t_metadata = time.time()
-                print(f"   -> Phase 6 Completed in {t_metadata - t_upsert:.2f}s (Total: {t_metadata - t_start:.2f}s)")
+            print(f"[INGESTION PHASE 6/6] Metadata & Index Building")
+            metadata_ready = await batch_metadata_service.rebuild_batch_metadata(batch_id, force=True)
+            await redis_client.delete(f"batch_meta:{batch_id}")
+            t_metadata = time.time()
+            print(f"   -> Phase 6 Completed in {t_metadata - t_upsert:.2f}s (Total: {t_metadata - t_start:.2f}s)")
+            if metadata_ready:
                 print(f"SUCCESS: Ingestion total time: {t_metadata - t_start:.2f}s\n")
-
-
-            # Update Celery Job Status
-            job_result = await db.execute(select(IngestionJob).where(IngestionJob.id == job_id))
-            job = job_result.scalars().first()
-            if job:
-                job.status = JobStatus.COMPLETED
-                job.document_id = file_id
-                await db.commit()
+            else:
+                print(f"INFO: No retrievable chunks available after ingestion for batch {batch_id}.")
+            
+            async with AsyncSessionLocal() as db:
+                # Update Celery Job Status
+                job_result = await db.execute(select(IngestionJob).where(IngestionJob.id == job_id))
+                job = job_result.scalars().first()
+                if job:
+                    job.status = JobStatus.COMPLETED
+                    job.document_id = file_id
+                    await db.commit()
 
     except Exception as e:
         traceback.print_exc()
@@ -1587,87 +1666,174 @@ async def chat(req: ChatRequest, request: Request, db: AsyncSession = Depends(ge
 
 async def _chat_logic(req: ChatRequest, db: AsyncSession, custom_api_key: str = None):
     t_start = time.time()
-    print(f"\n[INFERENCE] Starting Chat Inference for user {req.username}")
+    trace = PhaseTrace(
+        "CHAT",
+        f"user={req.username}|batch={req.active_batch_id}|complexity={req.complexity}|tutor={req.tutor_mode}|bypass={req.bypass_rag}",
+    )
+    trace.log("Starting chat inference")
     
     timings = {}
 
+    # --- NEW: RAG BYPASS MODE (Bypasses all Batch/Enrollment checks) ---
+    if req.bypass_rag:
+        trace.log("RAG Bypass Active: Routing directly to LLM")
+        response_start = trace.start_phase("Direct LLM Generation")
+        t_llm_start = time.time()
+        
+        # Simple instruction for direct chat
+        direct_prompt = f"Answer the following question directly: {req.message}"
+        reply = await call_gemini_async(direct_prompt, custom_api_key=custom_api_key)
+        
+        timings["llm_ms"] = round((time.time() - t_llm_start) * 1000, 2)
+        timings["total_ms"] = round((time.time() - t_start) * 1000, 2)
+        trace.complete_phase("Direct LLM Generation", response_start)
+        trace.success(detail="bypass_active=True")
+        return ChatResponse(reply=reply, citations=[], debug_timings=timings)
+
+    # --- NORMAL RAG PIPELINE (Requires Batch & Enrollment) ---
     # AC-45: Rate Limit - Check for 3min cooldown
+    cooldown_start = trace.start_phase("Cooldown Check")
     await check_cooldown(req.active_batch_id, req.message, "chat")
+    trace.complete_phase("Cooldown Check", cooldown_start)
 
+    enrollment_start = trace.start_phase("Enrollment Verification")
     await verify_user_enrollment(req.username, req.active_batch_id, db)
+    trace.complete_phase("Enrollment Verification", enrollment_start)
 
-    # 1. Ensure metadata is ready
-    if not await ensure_batch_is_loaded(req.active_batch_id, db):
-        return ChatResponse(reply="Currently we do not have the specific resources to answer this question.", citations=[])
+    admission_start = trace.start_phase("Tenant Admission")
+    async with tenant_runtime.acquire(
+        req.active_batch_id,
+        lane="online",
+        feature="chat",
+        http_on_timeout=True,
+    ):
+        trace.complete_phase("Tenant Admission", admission_start)
+        embedding_context = EmbeddingRequestContext()
 
-    # --- TIER 1: FULL RESPONSE CACHE (LLM BYPASS) ---
-    response_filters = {"complexity": req.complexity, "tutor_mode": str(req.tutor_mode)}
-    cached_response = await get_semantic_cache(req.active_batch_id, req.message, "chat_response", filters=response_filters)
+        # 1. Ensure metadata is ready
+        metadata_start = trace.start_phase("Batch Metadata Ready")
+        if not await ensure_batch_is_loaded(req.active_batch_id, db):
+            trace.complete_phase("Batch Metadata Ready", metadata_start, detail="ready=False")
+            return ChatResponse(reply="Currently we do not have the specific resources to answer this question.", citations=[])
+        trace.complete_phase("Batch Metadata Ready", metadata_start, detail="ready=True")
 
-    if cached_response:
-        print(f"   -> [TIER 1 HIT] Inference Bypassed via Response Cache in {time.time() - t_start:.2f}s")
-        return ChatResponse(
-            reply=cached_response["reply"], 
-            citations=cached_response.get("citations", []),
-            debug_timings={"total_ms": round((time.time() - t_start) * 1000, 2), "cache_hit": True}
+        # --- TIER 1: FULL RESPONSE CACHE (LLM BYPASS) ---
+        response_filters = {"complexity": req.complexity, "tutor_mode": str(req.tutor_mode)}
+        tier1_start = trace.start_phase("Tier 1 Response Cache Lookup")
+        cached_response = await get_semantic_cache(
+            req.active_batch_id,
+            req.message,
+            "chat_response",
+            filters=response_filters,
+            embedding_context=embedding_context,
+        )
+        trace.complete_phase(
+            "Tier 1 Response Cache Lookup",
+            tier1_start,
+            detail=f"cache_hit={bool(cached_response)}",
         )
 
-    # --- TIER 2: KNOWLEDGE CONTEXT CACHE (RETRIEVAL BYPASS) ---
-    candidates = None
-    cached_context = await get_semantic_cache(req.active_batch_id, req.message, "chat_context")
-
-    t_retrieval_start = time.time()
-    if cached_context:
-        print(f"   -> [TIER 2 HIT] Retrieval Bypassed via Context Cache")
-        candidates = cached_context
-        timings["retrieval_ms"] = 0
-    else:
-        # 2. Fetch Metadata (IMS RAM Lifecycle Lease)
-        brain_handle = index_manager.acquire(req.active_batch_id)
-        async with brain_handle as brain:
-            if not brain:
-                return ChatResponse(reply="Currently we do not have the specific resources to answer this question.", citations=[])
-
-            bm25 = brain["bm25"]
-            graph = brain["graph"]
-
-            # 3. Full Retrieval Pipeline
-            print(f"[INFERENCE PHASE 2/4] Query Rewriting")
-            # Wrap LLM call to pass the custom key
-            rewrite_result = await rewrite_query_ensemble(
-                query=req.message, 
-                call_llm_fn=lambda p: call_gemini_async(p, custom_api_key=custom_api_key)
+        if cached_response:
+            trace.success(detail="returned_from_cache=True")
+            return ChatResponse(
+                reply=cached_response["reply"], 
+                citations=cached_response.get("citations", []),
+                debug_timings={"total_ms": round((time.time() - t_start) * 1000, 2), "cache_hit": True}
             )
 
-            print(f"[INFERENCE PHASE 3/4] Retrieval & Reranking")
-            candidates = await retrieve_candidates(
-                query=req.message, 
-                rewrites=rewrite_result["rewrites"], 
-                bm25=bm25,
-                graph=graph,
-                chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_batch_id),
-                dense_fn=dense_retrieve, 
-                batch_id=req.active_batch_id, 
-                min_dense_score=req.min_dense_score,
-                t_inference_start=t_start
-            )
+        # --- TIER 2: KNOWLEDGE CONTEXT CACHE (RETRIEVAL BYPASS) ---
+        candidates = None
+        tier2_start = trace.start_phase("Tier 2 Context Cache Lookup")
+        cached_context = await get_semantic_cache(
+            req.active_batch_id,
+            req.message,
+            "chat_context",
+            embedding_context=embedding_context,
+        )
+        trace.complete_phase(
+            "Tier 2 Context Cache Lookup",
+            tier2_start,
+            detail=f"cache_hit={bool(cached_context)}",
+        )
 
-            if candidates:
-                # Save to Context Cache (Background) - Available for ANY complexity level
-                asyncio.create_task(set_semantic_cache(req.active_batch_id, req.message, "chat_context", candidates))
-    
-    timings["retrieval_ms"] = round((time.time() - t_retrieval_start) * 1000, 2)
+        t_retrieval_start = time.time()
+        if cached_context:
+            trace.log("Retrieval bypassed via cached context")
+            candidates = cached_context
+            timings["retrieval_ms"] = 0
+        else:
+            # 2. Fetch Metadata (IMS RAM Lifecycle Lease)
+            brain_handle = index_manager.acquire(req.active_batch_id)
+            async with brain_handle as brain:
+                if not brain:
+                    return ChatResponse(reply="Currently we do not have the specific resources to answer this question.", citations=[])
 
-    if not candidates: 
-        return ChatResponse(reply="Currently we do not have the answer for this question.", citations=[])
+                bm25 = brain["bm25"]
+                graph = brain["graph"]
 
-    # 4. Response Generation
-    print(f"[INFERENCE PHASE 4/4] Response Generation (Complexity: {req.complexity})")
-    complexity_instr = COMPLEXITY_MAP.get(req.complexity, COMPLEXITY_MAP["Undergrad"])
-    tutor_instr = TUTOR_PROMPT if req.tutor_mode else "Answer clearly based on the context."
-    context_text = "\n\n".join(f"[DOC_ID: {c['doc_id']}]\n{c['text']}" for c in candidates)
+                # 3. Full Retrieval Pipeline
+                # Wrap LLM call to pass the custom key
+                rewrite_start = trace.start_phase("Query Rewriting")
+                rewrite_result = await rewrite_query_ensemble(
+                    query=req.message, 
+                    call_llm_fn=lambda p: call_gemini_async(p, custom_api_key=custom_api_key),
+                    embedding_context=embedding_context,
+                )
+                trace.complete_phase(
+                    "Query Rewriting",
+                    rewrite_start,
+                    detail=f"rewrites={len(rewrite_result.get('rewrites', []))}",
+                )
 
-    final_prompt = f"""
+                retrieval_phase_start = trace.start_phase("Retrieval & Reranking")
+                candidates = await retrieve_candidates(
+                    query=req.message, 
+                    rewrites=rewrite_result["rewrites"], 
+                    bm25=bm25,
+                    graph=graph,
+                    chunk_fetcher=lambda ids: fetch_chunk_details(ids, req.active_batch_id),
+                    dense_fn=lambda q, batch_id, top_k=50: dense_retrieve(
+                        q,
+                        batch_id=batch_id,
+                        top_k=top_k,
+                        embedding_context=embedding_context,
+                    ),
+                    batch_id=req.active_batch_id, 
+                    min_dense_score=req.min_dense_score,
+                    t_inference_start=t_start
+                )
+                trace.complete_phase(
+                    "Retrieval & Reranking",
+                    retrieval_phase_start,
+                    detail=f"candidates={len(candidates)}",
+                )
+
+                if candidates:
+                    # Save to Context Cache (Background) - Available for ANY complexity level
+                    context_cache_dispatch_start = trace.start_phase("Context Cache Save Dispatch")
+                    asyncio.create_task(
+                        set_semantic_cache(
+                            req.active_batch_id,
+                            req.message,
+                            "chat_context",
+                            candidates,
+                            embedding_context=embedding_context,
+                        )
+                    )
+                    trace.complete_phase("Context Cache Save Dispatch", context_cache_dispatch_start)
+        
+        timings["retrieval_ms"] = round((time.time() - t_retrieval_start) * 1000, 2)
+
+        if not candidates: 
+            trace.log("No candidates found after retrieval")
+            return ChatResponse(reply="Currently we do not have the answer for this question.", citations=[])
+
+        # 4. Response Generation
+        complexity_instr = COMPLEXITY_MAP.get(req.complexity, COMPLEXITY_MAP["Undergrad"])
+        tutor_instr = TUTOR_PROMPT if req.tutor_mode else "Answer clearly based on the context."
+        context_text = "\n\n".join(f"[DOC_ID: {c['doc_id']}]\n{c['text']}" for c in candidates)
+
+        final_prompt = f"""
 Instructions:
 - {complexity_instr}
 - {tutor_instr}
@@ -1679,27 +1845,34 @@ Context:
 Question: {req.message}
 """.strip()
 
-    t_llm_start = time.time()
-    reply = await call_gemini_async(final_prompt, custom_api_key=custom_api_key)
-    timings["llm_ms"] = round((time.time() - t_llm_start) * 1000, 2)
+        response_start = trace.start_phase("Response Generation")
+        t_llm_start = time.time()
+        reply = await call_gemini_async(final_prompt, custom_api_key=custom_api_key)
+        timings["llm_ms"] = round((time.time() - t_llm_start) * 1000, 2)
+        trace.complete_phase("Response Generation", response_start)
 
-    # Extract citations
-    doc_ids = list(set([c['doc_id'] for c in candidates]))
-    found_citations = [did for did in doc_ids if f"[DOC_ID: {did}]" in reply]
+        # Extract citations
+        doc_ids = list(set([c['doc_id'] for c in candidates]))
+        found_citations = [did for did in doc_ids if f"[DOC_ID: {did}]" in reply]
 
-    # --- SAVE TO TIER 1 CACHE (Background) ---
-    NO_INFO_MSG = "Currently we do not have the answer for this question."
-    if reply.strip() != NO_INFO_MSG:
-        asyncio.create_task(set_semantic_cache(
-            req.active_batch_id, 
-            req.message, 
-            "chat_response", 
-            {"reply": reply, "citations": found_citations},
-            metadata={"complexity": req.complexity, "tutor_mode": str(req.tutor_mode)}
-        ))
-    else:
-        await set_cooldown(req.active_batch_id, req.message, "chat")
+        # --- SAVE TO TIER 1 CACHE (Background) ---
+        NO_INFO_MSG = "Currently we do not have the answer for this question."
+        if reply.strip() != NO_INFO_MSG:
+            cache_dispatch_start = trace.start_phase("Response Cache Save Dispatch")
+            asyncio.create_task(set_semantic_cache(
+                req.active_batch_id, 
+                req.message, 
+                "chat_response", 
+                {"reply": reply, "citations": found_citations},
+                metadata={"complexity": req.complexity, "tutor_mode": str(req.tutor_mode)},
+                embedding_context=embedding_context,
+            ))
+            trace.complete_phase("Response Cache Save Dispatch", cache_dispatch_start)
+        else:
+            cooldown_set_start = trace.start_phase("Cooldown Set")
+            await set_cooldown(req.active_batch_id, req.message, "chat")
+            trace.complete_phase("Cooldown Set", cooldown_set_start)
 
-    timings["total_ms"] = round((time.time() - t_start) * 1000, 2)
-    print(f"SUCCESS: Total Inference Time: {time.time() - t_start:.2f}s\n")
-    return ChatResponse(reply=reply, citations=found_citations, debug_timings=timings)
+        timings["total_ms"] = round((time.time() - t_start) * 1000, 2)
+        trace.success(detail=f"citations={len(found_citations)}")
+        return ChatResponse(reply=reply, citations=found_citations, debug_timings=timings)
